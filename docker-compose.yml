@@ -6,7 +6,7 @@ services:
       POSTGRES_USER: trade_compliance
       POSTGRES_PASSWORD: trade_compliance
     ports:
-      - "5432:5432"
+      - "55433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:

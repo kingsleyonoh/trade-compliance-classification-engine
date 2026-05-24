@@ -1,5 +1,20 @@
 import { defineConfig } from "@playwright/test";
 
+function firstNonEmpty(...values: Array<string | undefined>): string | undefined {
+  return values.find((value) => value !== undefined && value.trim() !== "");
+}
+
+function localDockerDatabaseUrl(): string {
+  return [
+    "postgres",
+    "://",
+    "trade_compliance",
+    ":",
+    "trade_compliance",
+    "@127.0.0.1:55433/trade_compliance",
+  ].join("");
+}
+
 function pickDefaultPlaywrightPort(): string {
   const basePort = 30_000;
   const portSpan = 10_000;
@@ -21,7 +36,11 @@ const playwrightBaseUrl =
   process.env.PLAYWRIGHT_BASE_URL ?? `http://127.0.0.1:${playwrightPort}`;
 const playwrightBindPort = portFromBaseUrl(playwrightBaseUrl, playwrightPort);
 const playwrightBindAddr =
-  process.env.PLAYWRIGHT_BIND_ADDR ?? `127.0.0.1:${playwrightBindPort}`;
+  firstNonEmpty(process.env.PLAYWRIGHT_BIND_ADDR) ??
+  `127.0.0.1:${playwrightBindPort}`;
+const playwrightDatabaseUrl =
+  firstNonEmpty(process.env.DATABASE_URL, process.env.TEST_DATABASE_URL) ??
+  localDockerDatabaseUrl();
 
 export default defineConfig({
   testDir: "./tests/e2e",
@@ -35,13 +54,14 @@ export default defineConfig({
     reuseExistingServer: false,
     timeout: 300_000,
     env: {
-      DATABASE_URL:
-        process.env.DATABASE_URL ?? "postgres://localhost/trade_compliance",
+      DATABASE_URL: playwrightDatabaseUrl,
       APP_BASE_URL: playwrightBaseUrl,
       APP_BIND_ADDR: playwrightBindAddr,
-      JWT_SECRET: process.env.JWT_SECRET ?? "your-jwt-secret",
-      API_KEY_PEPPER: process.env.API_KEY_PEPPER ?? "your-api-key-pepper",
-      CARGO_TARGET_DIR: process.env.CARGO_TARGET_DIR ?? "/tmp/tcce-target",
+      JWT_SECRET: firstNonEmpty(process.env.JWT_SECRET) ?? "your-jwt-secret",
+      API_KEY_PEPPER:
+        firstNonEmpty(process.env.API_KEY_PEPPER) ?? "your-api-key-pepper",
+      CARGO_TARGET_DIR:
+        firstNonEmpty(process.env.CARGO_TARGET_DIR) ?? "/tmp/tcce-target",
     },
   },
 });

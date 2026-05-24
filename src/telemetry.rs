@@ -42,6 +42,29 @@ impl MetricsRegistry {
         self.value("imports_started_total", tenant_id)
     }
 
+    pub fn render_prometheus(&self) -> String {
+        let counters = self
+            .counters
+            .lock()
+            .expect("metrics lock should not be poisoned");
+        let mut lines = vec![
+            "# HELP imports_started_total Product import rows accepted by tenant".to_string(),
+            "# TYPE imports_started_total counter".to_string(),
+        ];
+        if counters.is_empty() {
+            lines.push("imports_started_total{tenant_id=\"none\"} 0".to_string());
+        } else {
+            for (key, value) in counters.iter() {
+                lines.push(format!(
+                    "{}{{tenant_id=\"{}\"}} {}",
+                    key.name, key.tenant_id, value
+                ));
+            }
+        }
+        lines.push(String::new());
+        lines.join("\n")
+    }
+
     fn increment(&self, name: &'static str, tenant_id: Uuid) {
         let mut counters = self
             .counters
