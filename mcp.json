@@ -1,0 +1,20 @@
+{
+  "name": "trade-compliance-classification-engine",
+  "description": "MCP tool map for the Trade Compliance Classification Engine API.",
+  "tools": [
+    { "name": "register_tenant", "method": "POST", "path": "/api/tenants/register" },
+    { "name": "get_tenant_profile", "method": "GET", "path": "/tenants/me" },
+    { "name": "import_products", "method": "POST", "path": "/api/products/import" },
+    { "name": "list_products", "method": "GET", "path": "/api/products" },
+    { "name": "run_classification", "method": "POST", "path": "/api/classifications/run" },
+    { "name": "get_classification", "method": "GET", "path": "/api/classifications/{id}" },
+    { "name": "create_override", "method": "POST", "path": "/api/classifications/{id}/override" },
+    { "name": "upload_rule_pack", "method": "POST", "path": "/api/rule-packs" },
+    { "name": "validate_rule_pack", "method": "POST", "path": "/api/rule-packs/{id}/validate" },
+    { "name": "activate_rule_pack", "method": "POST", "path": "/api/rule-packs/{id}/activate" },
+    { "name": "queue_audit_export", "method": "POST", "path": "/api/audit-exports" },
+    { "name": "download_audit_export", "method": "GET", "path": "/api/audit-exports/{id}/download" },
+    { "name": "configure_integration", "method": "PUT", "path": "/api/integrations/{provider}" },
+    { "name": "run_backtest", "method": "POST", "path": "/api/backtests/run" }
+  ]
+}

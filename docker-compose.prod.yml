@@ -1,0 +1,31 @@
+services:
+  trade-compliance-classification-engine:
+    image: ghcr.io/kingsleyonoh/trade-compliance-classification-engine:latest
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.trade-compliance.rule=Host(`trade-compliance-classification-engine.kingsleyonoh.com`)"
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: trade
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: trade_compliance
+    volumes:
+      - trade_compliance_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trade -d trade_compliance"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  trade_compliance_pg:
