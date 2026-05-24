@@ -15,6 +15,7 @@ pub struct AppConfig {
     pub rag_platform: OptionalIntegrationConfig,
     pub notification_hub: OptionalIntegrationConfig,
     pub workflow_engine: WorkflowEngineConfig,
+    raw: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,7 +87,15 @@ impl AppConfig {
                 api_key: optional_non_empty(&vars, "WORKFLOW_ENGINE_API_KEY"),
                 high_risk_review_id: optional_non_empty(&vars, "WORKFLOW_HIGH_RISK_REVIEW_ID"),
             },
+            raw: vars,
         })
+    }
+
+    pub fn raw_value(&self, name: &str) -> Option<String> {
+        self.raw
+            .get(name)
+            .filter(|value| !value.trim().is_empty())
+            .cloned()
     }
 }
 

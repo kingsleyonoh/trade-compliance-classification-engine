@@ -1,5 +1,5 @@
 use axum::{routing::get, Router};
-use trade_compliance_classification_engine::config::AppConfig;
+use trade_compliance_classification_engine::{config::AppConfig, telemetry::init_tracing};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -17,12 +17,4 @@ fn app() -> Router {
         "/",
         get(|| async { "Trade Compliance Classification Engine" }),
     )
-}
-
-fn init_tracing(filter: &str) {
-    let subscriber = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .json()
-        .finish();
-    let _ = tracing::subscriber::set_global_default(subscriber);
 }
