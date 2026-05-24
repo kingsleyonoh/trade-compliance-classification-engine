@@ -6,6 +6,7 @@
 
 | File | Summary |
 |------|---------|
+| `core-config-loading.md` | AppConfig env loading, defaults, and optional-adapter disabled-by-default contract. |
 | `EXAMPLE.md` | Template showing the expected shape — delete once a real foundation primitive exists. |
 
 ## What belongs here
