@@ -1,0 +1,19 @@
+import type { Batch, BatchResult, GateResult } from "../types.js";
+import { hasDishonestSkipClaim, isPassingRunnableEvidence, isRunnableEvidence } from "./evidence-policy.js";
+
+const ENTRYPOINT_TAGS = new Set(["[API]", "[UI]", "[JOB]", "[INTEGRATION]"]);
+
+export function needsE2e(batch: Batch): boolean {
+  return batch.items.some((item) => ENTRYPOINT_TAGS.has(item.tag));
+}
+
+export function validateE2e(result: BatchResult, required: boolean): GateResult {
+  if (!required) return { name: "e2e", passed: true, flags: [] };
+  const evidence = result.tests?.e2e;
+  const flags = [];
+  if (!evidence) flags.push("MISSING_E2E_EVIDENCE");
+  if (evidence && !isRunnableEvidence(evidence)) flags.push("MISSING_RUNNABLE_E2E_COMMAND");
+  if (evidence && isRunnableEvidence(evidence) && evidence.exitCode !== 0) flags.push("E2E_DID_NOT_PASS");
+  if (evidence && hasDishonestSkipClaim(evidence.evidence) && !isPassingRunnableEvidence(evidence)) flags.push("E2E_DISHONEST_SKIP");
+  return { name: "e2e", passed: flags.length === 0, flags };
+}
