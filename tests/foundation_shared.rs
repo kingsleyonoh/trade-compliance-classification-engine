@@ -85,6 +85,8 @@ async fn api_error_response_uses_prd_error_envelope() {
 fn database_config_derives_pool_limits_from_app_config_without_connecting() {
     let app_config = AppConfig::from_env_overrides([
         ("DATABASE_URL", "postgres://localhost/trade_compliance"),
+        ("JWT_SECRET", "your-jwt-secret"),
+        ("API_KEY_PEPPER", "your-api-key-pepper"),
         ("DATABASE_MAX_CONNECTIONS", "7"),
         ("DATABASE_MIN_CONNECTIONS", "2"),
     ])
@@ -101,6 +103,8 @@ fn database_config_derives_pool_limits_from_app_config_without_connecting() {
 fn database_config_rejects_pool_min_greater_than_max() {
     let app_config = AppConfig::from_env_overrides([
         ("DATABASE_URL", "postgres://localhost/trade_compliance"),
+        ("JWT_SECRET", "your-jwt-secret"),
+        ("API_KEY_PEPPER", "your-api-key-pepper"),
         ("DATABASE_MAX_CONNECTIONS", "1"),
         ("DATABASE_MIN_CONNECTIONS", "2"),
     ])

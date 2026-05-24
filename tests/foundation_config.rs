@@ -3,9 +3,12 @@ use trade_compliance_classification_engine::setup::{run_setup, SetupMode, SetupS
 
 #[test]
 fn config_loads_local_defaults_and_optional_adapters_disabled() {
-    let config =
-        AppConfig::from_env_overrides([("DATABASE_URL", "postgres://localhost/trade_compliance")])
-            .expect("config should load with required database url");
+    let config = AppConfig::from_env_overrides([
+        ("DATABASE_URL", "postgres://localhost/trade_compliance"),
+        ("JWT_SECRET", "your-jwt-secret"),
+        ("API_KEY_PEPPER", "your-api-key-pepper"),
+    ])
+    .expect("config should load with required database url and secret material");
 
     assert_eq!(config.app_base_url.as_str(), "http://localhost:8080");
     assert!(config.self_registration_enabled);
@@ -24,9 +27,12 @@ fn config_rejects_missing_database_url() {
 
 #[tokio::test]
 async fn setup_scaffold_reports_pending_seed_without_database_side_effects() {
-    let config =
-        AppConfig::from_env_overrides([("DATABASE_URL", "postgres://localhost/trade_compliance")])
-            .expect("config should load");
+    let config = AppConfig::from_env_overrides([
+        ("DATABASE_URL", "postgres://localhost/trade_compliance"),
+        ("JWT_SECRET", "your-jwt-secret"),
+        ("API_KEY_PEPPER", "your-api-key-pepper"),
+    ])
+    .expect("config should load");
 
     let status = run_setup(&config, SetupMode::DryRun)
         .await

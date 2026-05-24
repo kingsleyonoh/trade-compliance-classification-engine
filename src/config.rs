@@ -67,8 +67,8 @@ impl AppConfig {
             app_base_url: optional(&vars, "APP_BASE_URL", "http://localhost:8080"),
             bind_addr: optional(&vars, "APP_BIND_ADDR", "127.0.0.1:8080"),
             self_registration_enabled: bool_var(&vars, "SELF_REGISTRATION_ENABLED", true)?,
-            jwt_secret: optional(&vars, "JWT_SECRET", "dev-only-change-me"),
-            api_key_pepper: optional(&vars, "API_KEY_PEPPER", "dev-only-change-me"),
+            jwt_secret: required(&vars, "JWT_SECRET")?,
+            api_key_pepper: required(&vars, "API_KEY_PEPPER")?,
             rust_log: optional(&vars, "RUST_LOG", "info"),
             sentry_dsn: optional_non_empty(&vars, "SENTRY_DSN"),
             rag_platform: OptionalIntegrationConfig {
