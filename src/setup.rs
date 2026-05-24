@@ -121,10 +121,16 @@ async fn seed_database(pool: &PgPool, mode: SetupMode) -> Result<SetupStatus, Se
     } else {
         None
     };
-    sqlx::query("INSERT INTO rule_packs (tenant_id, name, version, status, payload, validation_report, activated_at) VALUES ($1,'demo-hs-rules','2026.1','active',$2,$3,now()) ON CONFLICT (tenant_id, name, version) DO UPDATE SET payload = EXCLUDED.payload, validation_report = EXCLUDED.validation_report")
+    let demo_golden_cases = (0..10)
+        .map(|index| json!({"product":{"description":format!("woven cotton shirt demo case {index}"),"materials":["cotton"]},"expected_code":"6205"}))
+        .collect::<Vec<_>>();
+    let demo_rule_payload = json!({"rules":[{"id":"demo-shirt","code":"6205","contains":"shirt","confidence":0.91,"risk_band":"low"}],"golden_cases":demo_golden_cases});
+    sqlx::query("INSERT INTO rule_packs (tenant_id, name, version, jurisdiction, source_yaml, source_hash, compiled_wasm_sha256, golden_case_count, status, payload, validation_report, activated_at) VALUES ($1,'demo-hs-rules','2026.1','US',$2,$3,$3,10,'active',$4,$5,now()) ON CONFLICT (tenant_id, name, version) DO NOTHING")
         .bind(tenant_id)
-        .bind(json!({"rules":[{"match":"cotton shirt","hs":"6205"}]}))
-        .bind(json!({"valid":true}))
+        .bind(demo_rule_payload.to_string())
+        .bind(crate::auth::hash_api_key(&demo_rule_payload.to_string(), &api_key_pepper))
+        .bind(demo_rule_payload)
+        .bind(json!({"valid":true,"errors":[],"rule_count":1,"golden_case_count":10,"wasm_safety":{"valid":true},"matrix_coverage":{"valid":true}}))
         .execute(&mut *tx)
         .await
         .map_err(|error| SetupError::Database(error.to_string()))?;

@@ -1,8 +1,12 @@
 pub mod app;
 pub mod auth;
 pub mod cache;
+pub mod classification;
 pub mod config;
 pub mod db;
 pub mod errors;
+pub mod jobs;
+pub mod rules;
+pub mod search;
 pub mod setup;
 pub mod telemetry;

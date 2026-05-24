@@ -15,6 +15,7 @@ use crate::{
         policies::{can_scope, ResourceAction},
     },
     errors::ApiError,
+    search::index::{build_product_search_document, ProductSearchDocument},
 };
 
 #[derive(Debug, Deserialize)]
@@ -39,6 +40,7 @@ pub struct ProductInput {
 pub struct ListQuery {
     pub cursor: Option<String>,
     pub limit: Option<i64>,
+    pub query: Option<String>,
 }
 
 pub async fn import_products(
@@ -58,7 +60,14 @@ pub async fn import_products(
                 let source_row = serde_json::to_value(row).map_err(|_| {
                     ApiError::bad_request("invalid_product", "product row cannot be serialized")
                 })?;
-                sqlx::query("INSERT INTO products (tenant_id, sku, name, description, country_of_origin, jurisdiction, product_type, materials, intended_use, readiness_status, source_row) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::product_readiness_status,$11) ON CONFLICT (tenant_id, sku) DO UPDATE SET name = EXCLUDED.name, description = EXCLUDED.description, country_of_origin = EXCLUDED.country_of_origin, jurisdiction = EXCLUDED.jurisdiction, product_type = EXCLUDED.product_type, materials = EXCLUDED.materials, intended_use = EXCLUDED.intended_use, readiness_status = EXCLUDED.readiness_status, source_row = EXCLUDED.source_row, updated_at = now()")
+                let search_document = build_product_search_document(
+                    row.sku.as_deref().unwrap_or_default(),
+                    row.name.as_deref().unwrap_or_default(),
+                    row.description.as_deref().unwrap_or_default(),
+                    &row.materials,
+                    row.intended_use.as_deref(),
+                );
+                let product_id: Uuid = sqlx::query_scalar("INSERT INTO products (tenant_id, sku, name, description, country_of_origin, jurisdiction, product_type, materials, intended_use, readiness_status, source_row, search_document) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::product_readiness_status,$11,$12) ON CONFLICT (tenant_id, sku) DO UPDATE SET name = EXCLUDED.name, description = EXCLUDED.description, country_of_origin = EXCLUDED.country_of_origin, jurisdiction = EXCLUDED.jurisdiction, product_type = EXCLUDED.product_type, materials = EXCLUDED.materials, intended_use = EXCLUDED.intended_use, readiness_status = EXCLUDED.readiness_status, source_row = EXCLUDED.source_row, search_document = EXCLUDED.search_document, updated_at = now() RETURNING id")
                     .bind(context.tenant_id)
                     .bind(row.sku.as_ref().unwrap().trim())
                     .bind(row.name.as_ref().map(|s| s.trim()).unwrap_or(""))
@@ -70,9 +79,37 @@ pub async fn import_products(
                     .bind(row.intended_use.as_deref())
                     .bind(ready)
                     .bind(source_row)
-                    .execute(&state.pool)
+                    .bind(&search_document)
+                    .fetch_one(&state.pool)
                     .await
                     .map_err(ApiError::from_sqlx)?;
+                state
+                    .product_search_index
+                    .index(ProductSearchDocument {
+                        tenant_id: context.tenant_id,
+                        product_id,
+                        sku: row.sku.as_ref().unwrap().trim().to_owned(),
+                        name: row.name.as_ref().map(|s| s.trim()).unwrap_or("").to_owned(),
+                        description: row.description.as_ref().unwrap().trim().to_owned(),
+                        materials: row
+                            .materials
+                            .iter()
+                            .map(|material| material.trim().to_owned())
+                            .filter(|material| !material.is_empty())
+                            .collect(),
+                        intended_use: row
+                            .intended_use
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_owned),
+                    })
+                    .map_err(|_| {
+                        ApiError::service_unavailable(
+                            "product_search_unavailable",
+                            "product search index could not be updated",
+                        )
+                    })?;
                 imported += 1;
                 state.metrics.increment_imports_started(context.tenant_id);
             }
@@ -100,8 +137,55 @@ pub async fn list_products(
         _ => None,
     };
 
-    let mut builder: QueryBuilder<Postgres> = QueryBuilder::new("SELECT id, sku, name, description, country_of_origin, jurisdiction, readiness_status::text AS readiness_status, created_at::text AS created_at FROM products WHERE tenant_id = ");
+    let query_text = query
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let persisted_search_terms = query_text
+        .map(normalized_search_terms)
+        .filter(|terms| !terms.is_empty());
+    let search_ids = if let Some(query_text) = query_text {
+        let matches = state
+            .product_search_index
+            .search(context.tenant_id, query_text, limit as usize + 1)
+            .map_err(|_| {
+                ApiError::service_unavailable(
+                    "product_search_unavailable",
+                    "product search index could not be searched",
+                )
+            })?;
+        Some(
+            matches
+                .into_iter()
+                .map(|document| document.product_id)
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        None
+    };
+
+    let mut builder: QueryBuilder<Postgres> = QueryBuilder::new("SELECT id, sku, name, description, country_of_origin, jurisdiction, readiness_status::text AS readiness_status, search_document, created_at::text AS created_at FROM products WHERE tenant_id = ");
     builder.push_bind(context.tenant_id);
+    match (search_ids.as_ref(), persisted_search_terms.as_ref()) {
+        (Some(ids), Some(terms)) if !ids.is_empty() => {
+            builder.push(" AND (id = ANY(");
+            builder.push_bind(ids);
+            builder.push(") OR ");
+            push_persisted_search_terms(&mut builder, terms);
+            builder.push(")");
+        }
+        (Some(ids), _) if !ids.is_empty() => {
+            builder.push(" AND id = ANY(");
+            builder.push_bind(ids);
+            builder.push(")");
+        }
+        (_, Some(terms)) => {
+            builder.push(" AND ");
+            push_persisted_search_terms(&mut builder, terms);
+        }
+        _ => {}
+    }
     if let Some(cursor) = cursor {
         builder.push(" AND id > ");
         builder.push_bind(cursor);
@@ -187,6 +271,28 @@ fn row_error(row_number: usize, code: &'static str) -> Value {
     json!({ "row": row_number, "code": code, "message": format!("{code} for product import row") })
 }
 
+fn normalized_search_terms(query: &str) -> Vec<String> {
+    query
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn push_persisted_search_terms(builder: &mut QueryBuilder<Postgres>, terms: &[String]) {
+    builder.push("(");
+    for (index, term) in terms.iter().enumerate() {
+        if index > 0 {
+            builder.push(" AND ");
+        }
+        builder.push("lower(search_document) LIKE ");
+        builder.push_bind(format!("%{term}%"));
+    }
+    builder.push(")");
+}
+
 fn require_scope(scope: crate::auth::UserScope, action: ResourceAction) -> Result<(), ApiError> {
     if can_scope(scope, action) {
         Ok(())
@@ -207,7 +313,8 @@ fn product_summary(row: sqlx::postgres::PgRow) -> Value {
         "country_of_origin": row.get::<String, _>("country_of_origin"),
         "jurisdiction": row.get::<String, _>("jurisdiction"),
         "readiness_status": row.get::<String, _>("readiness_status"),
-        "created_at": row.get::<String, _>("created_at")
+        "created_at": row.get::<String, _>("created_at"),
+        "search_document": row.get::<String, _>("search_document")
     })
 }
 

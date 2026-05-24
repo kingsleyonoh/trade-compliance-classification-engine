@@ -9,10 +9,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{errors::ApiError, telemetry::MetricsRegistry};
+use crate::{errors::ApiError, search::index::ProductSearchIndex, telemetry::MetricsRegistry};
 
 pub mod health;
 pub mod products;
+pub mod rule_packs;
 pub mod tenants;
 
 #[derive(Clone)]
@@ -22,6 +23,7 @@ pub struct AppState {
     pub metrics: MetricsRegistry,
     pub api_key_pepper: String,
     pub registration_limiter: RegistrationLimiter,
+    pub product_search_index: ProductSearchIndex,
 }
 
 impl AppState {
@@ -37,6 +39,7 @@ impl AppState {
             metrics,
             api_key_pepper: api_key_pepper.into(),
             registration_limiter: RegistrationLimiter::default(),
+            product_search_index: ProductSearchIndex::default(),
         }
     }
 }
@@ -95,5 +98,15 @@ pub fn app(state: AppState) -> Router {
         .route("/api/products", get(products::list_products))
         .route("/api/products/import", post(products::import_products))
         .route("/api/products/:id", get(products::get_product))
+        .route("/api/rule-packs", post(rule_packs::upload_rule_pack))
+        .route("/api/rule-packs/upload", post(rule_packs::upload_rule_pack))
+        .route(
+            "/api/rule-packs/:id/validate",
+            post(rule_packs::validate_rule_pack),
+        )
+        .route(
+            "/api/rule-packs/:id/activate",
+            post(rule_packs::activate_rule_pack),
+        )
         .with_state(state)
 }

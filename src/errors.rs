@@ -52,6 +52,10 @@ impl ApiError {
         Self::new(StatusCode::NOT_FOUND, code, message)
     }
 
+    pub fn conflict(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, code, message)
+    }
+
     pub fn too_many_requests(code: &'static str, message: impl Into<String>) -> Self {
         Self::new(StatusCode::TOO_MANY_REQUESTS, code, message)
     }
@@ -64,6 +68,20 @@ impl ApiError {
         match error {
             sqlx::Error::RowNotFound => {
                 Self::not_found("not_found", "requested resource was not found")
+            }
+            sqlx::Error::Database(database_error)
+                if database_error.is_unique_violation()
+                    && database_error
+                        .constraint()
+                        .map(|constraint| {
+                            constraint == "rule_packs_tenant_jurisdiction_version_unique"
+                        })
+                        .unwrap_or(false) =>
+            {
+                Self::conflict(
+                    "rule_pack_version_conflict",
+                    "rule pack version already exists for this tenant and jurisdiction",
+                )
             }
             _ => Self::new(
                 StatusCode::INTERNAL_SERVER_ERROR,

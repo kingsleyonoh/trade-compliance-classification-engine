@@ -2,6 +2,36 @@ import { execFileSync } from "node:child_process";
 
 import { expect, test } from "@playwright/test";
 
+function goldenRuleSource(code: string): string {
+  return JSON.stringify({
+    rules: [
+      {
+        id: "shirt",
+        code,
+        contains: "shirt",
+        confidence: 0.91,
+        risk_band: "low",
+      },
+    ],
+    golden_cases: Array.from({ length: 10 }, (_, index) => ({
+      product: {
+        description: `woven cotton shirt case ${index}`,
+        materials: ["cotton"],
+      },
+      expected_code: code,
+    })),
+    coverage: {
+      outputs: [
+        "hs_hts_recommendation",
+        "duty_estimate",
+        "risk_band",
+        "audit_pack",
+        "denied_goods_flag",
+      ],
+    },
+  });
+}
+
 test("real HTTP server responds from the configured base URL", async ({
   request,
 }) => {
@@ -160,6 +190,48 @@ test("real HTTP product import enforces write scope and readiness facts", async 
   await expect(deniedImport.json()).resolves.toMatchObject({
     error: { code: "insufficient_scope" },
   });
+});
+
+test("real HTTP rule-pack lifecycle is admin-only and persists validation", async ({
+  request,
+}) => {
+  const unique = Date.now().toString();
+  const adminEmail = `rules-admin-${unique}@example.test`;
+  const registration = await request.post("/api/tenants/register", {
+    data: {
+      legal_name: `Rules Admin ${unique}`,
+      full_legal_name: `Rules Admin ${unique} Limited`,
+      display_name: `Rules Admin ${unique}`,
+      address: { line1: "1 Test Way" },
+      registration: { number: `RULE-${unique}` },
+      contact: { email: adminEmail },
+      wordmark: "Rules Admin",
+      regulator_ids: {},
+      admin_email: adminEmail,
+    },
+  });
+  expect(registration.status()).toBe(201);
+  const { api_key } = await registration.json();
+
+  const upload = await request.post("/api/rule-packs", {
+    headers: { "x-api-key": api_key },
+    data: {
+      name: `mvp-hs-${unique}`,
+      version: "2026.1",
+      jurisdiction: "US",
+      source: goldenRuleSource("6205.20"),
+    },
+  });
+  expect(upload.status()).toBe(201);
+  const pack = await upload.json();
+  expect(pack.validation_report.valid).toBe(true);
+
+  const activated = await request.post(`/api/rule-packs/${pack.id}/activate`, {
+    headers: { "x-api-key": api_key },
+    data: {},
+  });
+  expect(activated.status()).toBe(200);
+  await expect(activated.json()).resolves.toMatchObject({ status: "active" });
 });
 
 test("MOBILE_VIEWPORT_PASS mobile viewport loads the real HTTP app", async ({
