@@ -114,3 +114,47 @@ fn playwright_smoke_records_mobile_viewport_evidence() {
         "Playwright smoke spec must exercise a concrete mobile viewport"
     );
 }
+
+#[test]
+fn playwright_default_bind_port_is_not_fixed() {
+    let config =
+        fs::read_to_string("playwright.config.ts").expect("playwright config should exist");
+
+    assert!(
+        config.contains("PLAYWRIGHT_PORT"),
+        "Playwright config must expose a port override for runtime reruns"
+    );
+    assert!(
+        config.contains("pickDefaultPlaywrightPort"),
+        "Playwright config must allocate a non-fixed default port for the active worktree"
+    );
+    assert!(
+        !config.contains("http://127.0.0.1:18080") && !config.contains("127.0.0.1:18080"),
+        "Playwright config must not default to a fixed loopback port that can be denied or collide during runtime reruns"
+    );
+}
+
+#[test]
+fn prd_environment_examples_use_placeholder_database_credentials() {
+    let prd = fs::read_to_string("docs/trade-compliance-classification-engine_prd.md")
+        .expect("PRD should exist");
+
+    assert!(
+        prd.contains(
+            "DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@localhost:5432/trade_compliance"
+        ),
+        "PRD DATABASE_URL example must use scanner-allowlisted env placeholders"
+    );
+
+    for line in prd.lines().filter(|line| line.contains("postgres://")) {
+        if let Some(credentials) = line
+            .split_once("postgres://")
+            .and_then(|(_, rest)| rest.split_once('@').map(|(credentials, _)| credentials))
+        {
+            assert!(
+                !credentials.contains(':') || credentials.contains("${"),
+                "PostgreSQL examples must not embed literal username/password credentials: {line}"
+            );
+        }
+    }
+}
