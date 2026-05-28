@@ -11,6 +11,7 @@ use std::{
 
 use crate::{errors::ApiError, search::index::ProductSearchIndex, telemetry::MetricsRegistry};
 
+pub mod classifications;
 pub mod health;
 pub mod products;
 pub mod rule_packs;
@@ -98,6 +99,18 @@ pub fn app(state: AppState) -> Router {
         .route("/api/products", get(products::list_products))
         .route("/api/products/import", post(products::import_products))
         .route("/api/products/:id", get(products::get_product))
+        .route(
+            "/api/classifications/run",
+            post(classifications::run_classifications),
+        )
+        .route(
+            "/api/classifications",
+            get(classifications::list_classifications),
+        )
+        .route(
+            "/api/classifications/:id",
+            get(classifications::get_classification),
+        )
         .route("/api/rule-packs", post(rule_packs::upload_rule_pack))
         .route("/api/rule-packs/upload", post(rule_packs::upload_rule_pack))
         .route(

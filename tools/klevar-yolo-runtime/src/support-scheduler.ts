@@ -4,7 +4,7 @@ import type { Batch, ProgressItem } from "./types.js";
 
 export type SupportKind = "modularity" | "validate-prd" | "security-audit";
 
-interface SupportPlan {
+export interface SupportPlan {
   kind: SupportKind;
   scope: string;
   phase?: string;
@@ -15,10 +15,10 @@ const SUPPORT_SEQUENCE: SupportKind[] = ["modularity", "validate-prd", "security
 
 export async function nextSupportPlan(cwd: string, items: ProgressItem[]): Promise<SupportPlan | null> {
   const due = await nextDuePhaseSupport(cwd);
-  if (due) return makePlan(due.kind, due.phase, due.phase);
+  if (due) return makeSupportPlan(due.kind, due.phase, due.phase);
   if (items.some((item) => !item.checked)) return null;
   for (const kind of SUPPORT_SEQUENCE) {
-    if (!(await supportGateExists(cwd, kind, "final"))) return makePlan(kind, "final");
+    if (!(await supportGateExists(cwd, kind, "final"))) return makeSupportPlan(kind, "final");
   }
   return null;
 }
@@ -77,7 +77,7 @@ async function writeDue(cwd: string, phases: string[]): Promise<void> {
   await writeText(path.join(cwd, ".yolo/support-due.json"), JSON.stringify({ schemaVersion: 1, phases }, null, 2) + "\n");
 }
 
-function makePlan(kind: SupportKind, scope: string, phase?: string): SupportPlan {
+export function makeSupportPlan(kind: SupportKind, scope: string, phase?: string): SupportPlan {
   const label = phase ?? "Final project";
   const title = kind === "modularity"
     ? `${label} support — run modularity check and safe refactor sweep`

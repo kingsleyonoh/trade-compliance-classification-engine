@@ -12,22 +12,31 @@ import { readBatchResult, validateContract, writeBatchResult } from "./result-co
 import { runSubagent } from "./subagent-runner.js";
 import { finishRuntime, markTiming, resetRuntimeState, setAgent, setCheckpoint, setGates, setPhase } from "./telemetry.js";
 import { adjudicationAccepted, adjudicationAllowed, adjudicationNeedsBugfix, adjudicationNeedsHuman, adjudicationReport, readAdjudicationFile, readExistingAdjudication } from "./adjudication.js";
-import { gatesPassed, validateAll } from "./validators/index.js";
+import { gatesPassed, validateAll, validateAllWithState } from "./validators/index.js";
 import { loadClaims, markRuntimeClaim, prepareRuntimeClaim, validateClaims } from "./collaboration/claims.js";
 import { planParallelBatches } from "./collaboration/scheduler.js";
 import { createWorktree } from "./worktree-manager.js";
 import { pruneSuccessfulWorktrees } from "./worktree-retention.js";
 import { syncLocalOnlyFilesToRoot, syncWorktreeChangesToRoot } from "./worktree-sync.js";
-import { applySupportPlan, markPhaseSupportDue, nextSupportPlan, supportGateStem } from "./support-scheduler.js";
+import { applySupportPlan, makeSupportPlan, markPhaseSupportDue, nextSupportPlan, supportGateStem, type SupportKind, type SupportPlan } from "./support-scheduler.js";
+import { cleanupBatchDockerResources } from "./docker-cleanup.js";
+import { blockingOpenFindings, canonicalizeBatchResultForRuntime, importAgentResultToState, recordGateState, writeRuntimeBatchState } from "./runtime-batch-state.js";
+import { validationPolicyFor } from "./validation-policy.js";
+import { acquireRuntimeLock, heartbeatRuntimeLock, releaseRuntimeLock } from "./runtime-lock.js";
 import path from "node:path";
 import { readFile, readdir } from "node:fs/promises";
 import { copyPath, exists } from "./util/fs.js";
 import { createCommit, git, nextBatchNumber } from "./util/git.js";
+import { execCommand } from "./util/process.js";
 export { mergeRecoveredResult, mergeRecoveredResultFromDisk } from "./recovery-merge.js";
 import { mergeRecoveredResultFromDisk } from "./recovery-merge.js";
 import type { AgentRole, Batch, BatchResult, GateResult, ProgressItem, RuntimeConfig, YoloScope } from "./types.js";
 
 export async function runYolo(cwd: string, scope: YoloScope, dryRun: boolean): Promise<void> {
+  const lock = dryRun ? null : acquireRuntimeLock(cwd, scopeLabel(scope));
+  if (lock && !lock.ok) throw new Error(`Klevar YOLO already running: ${lock.reason}`);
+  const lockHeartbeat = dryRun ? null : setInterval(() => heartbeatRuntimeLock(cwd), 30_000);
+  try {
   const config = await loadConfig(cwd);
   if (scope.mode === "resume") return continueYolo(cwd, config, dryRun);
   if (scope.mode === "parallel") return runParallelYolo(cwd, config, scope, dryRun);
@@ -46,6 +55,10 @@ export async function runYolo(cwd: string, scope: YoloScope, dryRun: boolean): P
     }
   }
   await runSingleBatch(cwd, config, scope, dryRun);
+  } finally {
+    if (lockHeartbeat) clearInterval(lockHeartbeat);
+    if (!dryRun) releaseRuntimeLock(cwd);
+  }
 }
 
 async function runSingleBatch(cwd: string, config: RuntimeConfig, scope: YoloScope, dryRun: boolean): Promise<"complete" | "none" | "failed"> {
@@ -82,17 +95,22 @@ async function runSingleBatch(cwd: string, config: RuntimeConfig, scope: YoloSco
   await setPhase(cwd, "implement", "Starting implement agent", { worktree: lease.cwd });
   const implStart = Date.now();
   let result = await runImplementationAgent(cwd, lease.cwd, batch, config, context);
+  result = (await importAgentResultToState(lease.cwd, batch, result.agent, result)).currentResult;
   await copyBatchResultArtifacts(lease.cwd, cwd, batch, batch.type === "audit" ? "audit" : "implement");
   await markTiming(cwd, "implementMs", Date.now() - implStart);
   await setCheckpoint(cwd, "implement", "passed");
   await setPhase(cwd, "validate", "Running runtime gates");
   const gateStart = Date.now();
-  const gates = [claimGate, ...await validateAll(lease.cwd, batch, result, config, cwd)];
+  const validation = await validateAllWithState(lease.cwd, batch, result, config, cwd);
+  const gates = [claimGate, ...validation.gates];
+  await writeRuntimeBatchState(lease.cwd, recordGateState(validation.state, gates));
   await markTiming(cwd, "runtimeGatesMs", Date.now() - gateStart);
   await setGates(cwd, gates);
   await writeRuntimeGates(cwd, batch, gates);
   await setCheckpoint(cwd, "runtimeGates", gatesPassed(gates) ? "passed" : "failed");
   await appendJournal(cwd, batch, result, gates);
+  const openFindings = blockingOpenFindings(validation.state);
+  if (!gatesPassed(gates) && openFindings.length === 0) await writeGate(cwd, "findings", `batch-${String(batch.number).padStart(3, "0")}`, "PASS", batch.number, ["no open blocking canonical findings"]);
   const adjudication = !gatesPassed(gates) ? await adjudicateIfPossible(cwd, lease.cwd, batch, config, context, result, gates) : "none";
   if (adjudication === "accepted") {
     await setCheckpoint(cwd, "runtimeGates", "passed");
@@ -103,16 +121,18 @@ async function runSingleBatch(cwd: string, config: RuntimeConfig, scope: YoloSco
       await handleRejected(cwd, batch, result, recovery.flags.length ? recovery.flags : gates.flatMap((gate) => gate.flags), config);
       return "failed";
     }
-    result = recovery.result;
+    result = (await importAgentResultToState(lease.cwd, batch, "bugfix", recovery.result)).currentResult;
     await setCheckpoint(cwd, "runtimeGates", "passed");
   }
-  if (config.gates.requireAdversarialValidation) {
+  const policy = validationPolicyFor(batch, result, config);
+  if (policy.requireAdversarialValidation) {
+    await setPhase(cwd, "validate", `Adversarial validation (${policy.mode}/${policy.risk})`, { inspect: { risk: policy.risk, validationMode: policy.mode } });
     const recovered = await validateAdversarial(cwd, lease.cwd, batch, config, context, result);
     if (!recovered) {
       await markRuntimeClaim(cwd, config, batch, "blocked");
       return "failed";
     }
-    result = recovered;
+    result = (await importAgentResultToState(lease.cwd, batch, "validate", recovered)).currentResult;
   }
   await setCheckpoint(cwd, "validate", "passed");
   const journalResult = await runJournalAgent(cwd, lease.cwd, batch, config, context);
@@ -132,6 +152,7 @@ async function runSingleBatch(cwd: string, config: RuntimeConfig, scope: YoloSco
   if (batch.supportKind && batch.supportScope) await writeGate(cwd, `support-${batch.supportKind}`, supportGateStem(batch.supportScope), "PASS", batch.number, [`scope:${batch.supportScope}`]);
   await setGates(cwd, [{ name: "closeout", passed: true, flags: [] }]);
   await markRuntimeClaim(cwd, config, batch, "done");
+  await cleanupDockerForBatch(cwd, batch.number, "success", config);
   await setPhase(cwd, "commit", "Creating runtime-owned batch commit");
   const commit = await createCommit(cwd, `feat(yolo): complete batch ${String(batch.number).padStart(3, "0")}`);
   await setCheckpoint(cwd, "commit", "passed");
@@ -161,8 +182,9 @@ async function continueYolo(cwd: string, config: RuntimeConfig, dryRun: boolean)
     return;
   }
   const items = await parseProgress(cwd);
-  const selected = selectBatch(items, config.maxBatchSize, `next 1`);
-  const batch: Batch = { number: batchNumber, type: classifyBatchType(selected), items: selected };
+  const support = supportPlanFromRuntimeState(state);
+  const selected = support ? [support.item] : selectBatch(items, config.maxBatchSize, `next 1`);
+  const batch: Batch = support ? applySupportPlan({ number: batchNumber, type: "implement", items: selected }, support) : { number: batchNumber, type: classifyBatchType(selected), items: selected };
   if (batch.items.length === 0) {
     console.log("No unchecked progress item found for resumable batch; refusing ambiguous continue.");
     return;
@@ -171,39 +193,58 @@ async function continueYolo(cwd: string, config: RuntimeConfig, dryRun: boolean)
   if (dryRun) return;
   const suffix = batch.type === "audit" ? "audit" : "implement";
   const resultFile = path.join(worktree, `.yolo/batch-results/batch-${String(batchNumber).padStart(3, "0")}-${suffix}.json`);
-  if (state?.status === "running" && !(await exists(resultFile))) {
-    console.log(`Batch ${batchNumber} is already running; no ${suffix} result exists yet. Use /yolo-dashboard instead of /klevar-yolo continue until the active agent finishes.`);
-    return;
+  const hasResult = await exists(resultFile);
+  const context = await buildVisibleBatchContext(cwd, worktree, batch, config);
+  let result: BatchResult;
+  if (state?.status === "running" && !hasResult) {
+    if (!runningNoResultIsStale(state, config, batch)) {
+      console.log(`Batch ${batchNumber} is already running; no ${suffix} result exists yet. Use /yolo-dashboard instead of /klevar-yolo continue until the active agent finishes.`);
+      return;
+    }
+    await setPhase(cwd, "implement", `Recovering stale running batch ${batchNumber}; restarting ${suffix} agent in existing worktree`, { batch: batchNumber, worktree, inspect: { ...(state?.inspect ?? {}), requestedScope } });
+    const implStart = Date.now();
+    result = await runImplementationAgent(cwd, worktree, batch, config, context);
+    result = (await importAgentResultToState(worktree, batch, result.agent, result)).currentResult;
+    await copyBatchResultArtifacts(worktree, cwd, batch, suffix);
+    await markTiming(cwd, "implementMs", Date.now() - implStart);
+    await setCheckpoint(cwd, "implement", "passed");
+  } else {
+    result = await readBatchResult(resultFile);
+    result = await mergeExistingBugfixResults(worktree, batchNumber, result);
+    result = (await importAgentResultToState(worktree, batch, result.agent, result)).currentResult;
+    if (isNonResumableResult(result)) {
+      const flags = [result.failureType ?? result.status, ...(result.flags ?? [])].filter(Boolean);
+      await finishRuntime(cwd, "failed", `Batch ${batchNumber} is not safely resumable; clean and rerun: ${flags.join(", ")}`);
+      rejectBatch(batchNumber, ["NON_RESUMABLE_BATCH", ...flags]);
+      return;
+    }
+    await copyBatchResultArtifacts(worktree, cwd, batch, suffix);
   }
   await setPhase(cwd, "validate", "Continuing from existing worktree result", { batch: batchNumber, worktree, inspect: { ...(state?.inspect ?? {}), requestedScope } });
-  let result = await readBatchResult(resultFile);
-  result = await mergeExistingBugfixResults(worktree, batchNumber, result);
-  if (isNonResumableResult(result)) {
-    const flags = [result.failureType ?? result.status, ...(result.flags ?? [])].filter(Boolean);
-    await finishRuntime(cwd, "failed", `Batch ${batchNumber} is not safely resumable; clean and rerun: ${flags.join(", ")}`);
-    rejectBatch(batchNumber, ["NON_RESUMABLE_BATCH", ...flags]);
-    return;
-  }
-  await copyBatchResultArtifacts(worktree, cwd, batch, suffix);
-  const context = await buildVisibleBatchContext(cwd, worktree, batch, config);
-  const gates = await validateAll(worktree, batch, result, config, cwd);
+  const validation = await validateAllWithState(worktree, batch, result, config, cwd);
+  const gates = validation.gates;
+  await writeRuntimeBatchState(worktree, recordGateState(validation.state, gates));
   await setGates(cwd, gates);
   await writeRuntimeGates(cwd, batch, gates);
   await setCheckpoint(cwd, "runtimeGates", gatesPassed(gates) ? "passed" : "failed");
   await appendJournal(cwd, batch, result, gates);
+  const openFindings = blockingOpenFindings(validation.state);
+  if (!gatesPassed(gates) && openFindings.length === 0) await writeGate(cwd, "findings", `batch-${String(batch.number).padStart(3, "0")}`, "PASS", batch.number, ["no open blocking canonical findings"]);
   const adjudication = !gatesPassed(gates) ? await adjudicateIfPossible(cwd, worktree, batch, config, context, result, gates) : "none";
   if (adjudication === "accepted") {
     await setCheckpoint(cwd, "runtimeGates", "passed");
   } else if (!gatesPassed(gates)) {
     const recovery = await recoverGateFailure(cwd, worktree, batch, config, context, result, gates.flatMap((gate) => gate.flags));
     if (!recovery.result) return handleRejected(cwd, batch, result, recovery.flags.length ? recovery.flags : gates.flatMap((gate) => gate.flags), config);
-    result = recovery.result;
+    result = (await importAgentResultToState(worktree, batch, "bugfix", recovery.result)).currentResult;
     await setCheckpoint(cwd, "runtimeGates", "passed");
   }
-  if (config.gates.requireAdversarialValidation) {
+  const policy = validationPolicyFor(batch, result, config);
+  if (policy.requireAdversarialValidation) {
+    await setPhase(cwd, "validate", `Adversarial validation (${policy.mode}/${policy.risk})`, { inspect: { risk: policy.risk, validationMode: policy.mode } });
     const recovered = await validateAdversarial(cwd, worktree, batch, config, context, result);
     if (!recovered) return;
-    result = recovered;
+    result = (await importAgentResultToState(worktree, batch, "validate", recovered)).currentResult;
   }
   await setCheckpoint(cwd, "validate", "passed");
   const journalResult = await reuseOrRunJournalAgent(cwd, worktree, batch, config, context);
@@ -220,6 +261,7 @@ async function continueYolo(cwd: string, config: RuntimeConfig, dryRun: boolean)
   if (batch.supportKind && batch.supportScope) await writeGate(cwd, `support-${batch.supportKind}`, supportGateStem(batch.supportScope), "PASS", batch.number, [`scope:${batch.supportScope}`]);
   await setGates(cwd, [{ name: "closeout", passed: true, flags: [] }]);
   await markRuntimeClaim(cwd, config, batch, "done");
+  await cleanupDockerForBatch(cwd, batch.number, "success", config);
   await setPhase(cwd, "commit", "Creating runtime-owned continued batch commit");
   const commit = await createCommit(cwd, `feat(yolo): complete batch ${String(batch.number).padStart(3, "0")}`);
   await setCheckpoint(cwd, "commit", "passed");
@@ -336,12 +378,31 @@ function scopeLabel(scope: YoloScope): string {
   return scope.mode === "full" ? "full" : scope.mode === "count" ? `next ${scope.target}` : scope.mode === "phase" ? `phase ${scope.target}` : scope.mode;
 }
 
-async function readRuntimeState(cwd: string): Promise<{ status?: string; batch?: number; worktree?: string; inspect?: Record<string, string> } | null> {
+async function readRuntimeState(cwd: string): Promise<{ status?: string; batch?: number; worktree?: string; inspect?: Record<string, string>; updatedAt?: string } | null> {
   try {
-    return JSON.parse(await readFile(path.join(cwd, ".yolo/runtime-state.json"), "utf8")) as { status?: string; batch?: number; worktree?: string; inspect?: Record<string, string> };
+    return JSON.parse(await readFile(path.join(cwd, ".yolo/runtime-state.json"), "utf8")) as { status?: string; batch?: number; worktree?: string; inspect?: Record<string, string>; updatedAt?: string };
   } catch {
     return null;
   }
+}
+
+function supportPlanFromRuntimeState(state: { inspect?: Record<string, string> } | null): SupportPlan | null {
+  const kind = state?.inspect?.supportKind;
+  const scope = state?.inspect?.supportScope;
+  if (!isSupportKind(kind) || !scope) return null;
+  return makeSupportPlan(kind, scope, scope === "final" ? undefined : scope);
+}
+
+function isSupportKind(value: unknown): value is SupportKind {
+  return value === "modularity" || value === "validate-prd" || value === "security-audit";
+}
+
+function runningNoResultIsStale(state: { updatedAt?: string } | null, config: RuntimeConfig, batch: Batch): boolean {
+  const updatedAt = state?.updatedAt ? Date.parse(state.updatedAt) : NaN;
+  if (!Number.isFinite(updatedAt)) return false;
+  const role: AgentRole = batch.type === "audit" ? "audit" : "implement";
+  const staleMs = config.models[role].budget?.staleMs ?? 30 * 60_000;
+  return Date.now() - updatedAt > staleMs;
 }
 
 async function runParallelYolo(cwd: string, config: RuntimeConfig, scope: Extract<YoloScope, { mode: "parallel" }>, dryRun: boolean): Promise<void> {
@@ -437,8 +498,10 @@ async function makeBatch(cwd: string, config: RuntimeConfig, scope: YoloScope): 
   const scopeText = scope.mode === "count" ? `next ${scope.target}` : scope.mode === "phase" ? `phase ${scope.target}` : "full";
   const selected = selectBatch(items, config.maxBatchSize, scopeText);
   const batchNumber = await nextBatchNumber(cwd);
-  const support = scope.mode === "full" ? await nextSupportPlan(cwd, items) : null;
-  const routed = support ? { items: [support.item], entries: [], mode: "none" as const, gate: { name: "inbox", passed: true, flags: [`SUPPORT_WORKFLOW:${support.kind}`, `SUPPORT_SCOPE:${support.scope}`] } } : await routeInboxWithAi(cwd, batchNumber, selected, await readPendingInbox(cwd), config);
+  const pendingInbox = await readPendingInbox(cwd);
+  const hasHighInbox = pendingInbox.some((entry) => entry.priority === "HIGH");
+  const support = scope.mode === "full" && !hasHighInbox ? await nextSupportPlan(cwd, items) : null;
+  const routed = support ? { items: [support.item], entries: [], mode: "none" as const, gate: { name: "inbox", passed: true, flags: [`SUPPORT_WORKFLOW:${support.kind}`, `SUPPORT_SCOPE:${support.scope}`] } } : await routeInboxWithAi(cwd, batchNumber, selected, pendingInbox, config);
   const batch = applySupportPlan({ number: batchNumber, items: routed.items, type: classifyBatchType(routed.items) }, support);
   if (batch.items.length > 0) await writeInboxRouteGate(cwd, batch, routed.gate);
   return batch;
@@ -481,7 +544,7 @@ async function runImplementationAgent(rootCwd: string, cwd: string, batch: Batch
 
 async function validateAdversarial(rootCwd: string, cwd: string, batch: Batch, config: RuntimeConfig, context: string, implementation: BatchResult): Promise<BatchResult | null> {
   await setPhase(rootCwd, "validate", "Running adversarial validation agent");
-  const validation = await runValidator(rootCwd, cwd, batch, config, context);
+  const validation = (await importAgentResultToState(cwd, batch, "validate", await runValidator(rootCwd, cwd, batch, config, context))).currentResult;
   const validationGate = validateContract(validation);
   if (validationGate.passed && validation.status === "SUCCESS") return implementation;
   const flags = [...validationGate.flags, ...(validation.flags ?? []), validation.failureType ?? "VALIDATOR_REJECTED"];
@@ -489,9 +552,21 @@ async function validateAdversarial(rootCwd: string, cwd: string, batch: Batch, c
   let currentValidation = validation;
   let currentFlags = flags;
   const attempts = Math.max(1, config.recovery?.maxBugfixAttempts ?? 1);
-  for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    await setPhase(rootCwd, "bugfix", `Validation rejected batch ${batch.number}; dispatching bugfix recovery attempt ${attempt}/${attempts}`);
-    const bugfix = await runBugfixAgent(rootCwd, cwd, batch, config, context, currentValidation, currentFlags, attempt);
+  const maxTotalAttempts = attempts * 4;
+  let totalAttempts = 0;
+  let currentSignature = failureSignature(currentFlags, currentValidation.failureType);
+  let attemptForSignature = 0;
+  while (totalAttempts < maxTotalAttempts) {
+    const nextSignature = failureSignature(currentFlags, currentValidation.failureType);
+    if (nextSignature !== currentSignature) {
+      currentSignature = nextSignature;
+      attemptForSignature = 0;
+    }
+    if (attemptForSignature >= attempts) break;
+    attemptForSignature += 1;
+    totalAttempts += 1;
+    await setPhase(rootCwd, "bugfix", `Validation rejected batch ${batch.number}; dispatching bugfix recovery attempt ${attemptForSignature}/${attempts} for ${currentSignature}`);
+    const bugfix = await runBugfixAgent(rootCwd, cwd, batch, config, context, currentValidation, currentFlags, totalAttempts);
     const bugfixGate = validateContract(bugfix);
     if (!bugfixGate.passed || bugfix.status !== "SUCCESS") {
       currentFlags = [...bugfixGate.flags, ...(bugfix.flags ?? []), bugfix.failureType ?? "BUGFIX_RECOVERY_FAILED"];
@@ -499,9 +574,10 @@ async function validateAdversarial(rootCwd: string, cwd: string, batch: Batch, c
       continue;
     }
     await canonicalizeBatchResultManifests(cwd, batch.number);
-    recovered = await mergeRecoveredResultFromDisk(cwd, batch.number, recovered, bugfix);
+    recovered = (await importAgentResultToState(cwd, batch, "bugfix", await mergeRecoveredResultFromDisk(cwd, batch.number, recovered, bugfix))).currentResult;
     await setPhase(rootCwd, "validate", "Re-running runtime gates after bugfix recovery");
-    const gates = await validateAll(cwd, batch, recovered, config, rootCwd);
+    const validation = await validateAllWithState(cwd, batch, recovered, config, rootCwd);
+    const gates = validation.gates;
     await setGates(rootCwd, gates);
     await writeRuntimeGates(rootCwd, batch, gates);
     if (!gatesPassed(gates)) {
@@ -513,14 +589,73 @@ async function validateAdversarial(rootCwd: string, cwd: string, batch: Batch, c
       continue;
     }
     await setPhase(rootCwd, "validate", "Re-running adversarial validation after bugfix recovery");
-    currentValidation = await runValidator(rootCwd, cwd, batch, config, `${context}\n\n---\n\n# Bugfix Recovery Applied\n${JSON.stringify(bugfix, null, 2)}`);
+    currentValidation = (await importAgentResultToState(cwd, batch, "validate", await runValidator(rootCwd, cwd, batch, config, `${context}\n\n---\n\n# Bugfix Recovery Applied\n${JSON.stringify(bugfix, null, 2)}`))).currentResult;
     const secondGate = validateContract(currentValidation);
     if (secondGate.passed && currentValidation.status === "SUCCESS") return recovered;
+    if (secondGate.passed && currentValidation.status === "FAILURE" && (
+      await validationFailureLooksStale(cwd, currentValidation)
+      || validationFailureContradictedByRecoveredEvidence(currentValidation, recovered, bugfix)
+    )) return recovered;
     currentFlags = [...secondGate.flags, ...(currentValidation.flags ?? []), currentValidation.failureType ?? "VALIDATOR_REJECTED_AFTER_BUGFIX"];
   }
   await finishRuntime(rootCwd, "failed", `Adversarial validation rejected recovered batch ${batch.number}: ${currentFlags.join(", ")}`);
   rejectBatch(batch.number, currentFlags);
   return null;
+}
+
+async function validationFailureLooksStale(cwd: string, validation: BatchResult): Promise<boolean> {
+  const red = validation.tests?.red;
+  if (!red || red.exitCode === 0 || !isRunnableValidationCommand(red.command)) return false;
+  const run = await execCommand(red.command, cwd, { timeoutMs: 5 * 60_000 });
+  return run.exitCode === 0;
+}
+
+export function validationFailureContradictedByRecoveredEvidence(validation: BatchResult, recovered: BatchResult, bugfix: BatchResult): boolean {
+  if (validation.status !== "FAILURE") return false;
+  const flags = [...(validation.flags ?? []), validation.failureType].filter((flag): flag is string => Boolean(flag));
+  const blocking = flags.filter((flag) => !isPositiveValidationFlag(flag));
+  if (blocking.length === 0) return false;
+  return blocking.every((flag) => recoveredEvidenceContradictsFlag(flag, recovered, bugfix));
+}
+
+function recoveredEvidenceContradictsFlag(flag: string, recovered: BatchResult, bugfix: BatchResult): boolean {
+  if (flag === "MISSING_RUNNABLE_E2E_COMMAND") return hasPassingRunnableE2e(recovered) || hasPassingRunnableE2e(bugfix);
+  if (flag.startsWith("ENTRYPOINT_UNVERIFIED:")) {
+    const entrypoint = flag.slice("ENTRYPOINT_UNVERIFIED:".length);
+    return hasWiringEntrypointEvidence(recovered, entrypoint) || hasWiringEntrypointEvidence(bugfix, entrypoint);
+  }
+  if (/UNWIRED|DRIFT|NOT_PROPAGATED|MISSING/i.test(flag)) {
+    return hasPassingValidationEvidence(bugfix) && (bugfix.flags ?? []).some((fixedFlag) => /WIRED|PROPAGATED|FIXED|PASS/i.test(fixedFlag));
+  }
+  return false;
+}
+
+function isPositiveValidationFlag(flag: string): boolean {
+  return /(?:_PASS|_PASSED|_FIXED|_WIRED|_PROPAGATED|_SATISFIED|_COVERED|_ENFORCED)$/i.test(flag);
+}
+
+function hasPassingRunnableE2e(result: BatchResult): boolean {
+  const e2e = result.tests?.e2e;
+  return Boolean(e2e?.command && e2e.exitCode === 0 && isRunnableValidationCommand(e2e.command));
+}
+
+function hasPassingValidationEvidence(result: BatchResult): boolean {
+  return Object.values(result.tests ?? {}).some((test) => Boolean(test?.command && test.exitCode === 0));
+}
+
+function hasWiringEntrypointEvidence(result: BatchResult, expected: string): boolean {
+  const expectedKey = evidenceKey(expected);
+  return (result.wiring?.entrypoints ?? []).some((entrypoint) => evidenceKey(typeof entrypoint === "string" ? entrypoint : JSON.stringify(entrypoint)).includes(expectedKey));
+}
+
+function evidenceKey(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function isRunnableValidationCommand(command: string | undefined): command is string {
+  const value = command?.trim() ?? "";
+  if (!value || /^(not applicable|n\/a|none|skipped?|manual|unknown)$/i.test(value)) return false;
+  return /^(node|npm|npx|bash|sh|python|python3|ruby|go|cargo|pytest|julia|nim|deno|bun|pnpm|yarn)\b/i.test(value);
 }
 
 async function recoverGateFailure(rootCwd: string, cwd: string, batch: Batch, config: RuntimeConfig, context: string, implementation: BatchResult, flags: string[]): Promise<{ result: BatchResult | null; flags: string[] }> {
@@ -531,19 +666,32 @@ async function recoverGateFailure(rootCwd: string, cwd: string, batch: Batch, co
   let recovered = implementation;
   let currentFlags = flags;
   const attempts = Math.max(1, config.recovery?.maxBugfixAttempts ?? 1);
-  for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    await setPhase(rootCwd, "bugfix", `Runtime gates rejected batch ${batch.number}; dispatching bugfix recovery attempt ${attempt}/${attempts}`);
+  const maxTotalAttempts = attempts * 4;
+  let totalAttempts = 0;
+  let currentSignature = failureSignature(currentFlags, "RUNTIME_GATES_REJECTED");
+  let attemptForSignature = 0;
+  while (totalAttempts < maxTotalAttempts) {
+    const nextSignature = failureSignature(currentFlags, "RUNTIME_GATES_REJECTED");
+    if (nextSignature !== currentSignature) {
+      currentSignature = nextSignature;
+      attemptForSignature = 0;
+    }
+    if (attemptForSignature >= attempts) break;
+    attemptForSignature += 1;
+    totalAttempts += 1;
+    await setPhase(rootCwd, "bugfix", `Runtime gates rejected batch ${batch.number}; dispatching bugfix recovery attempt ${attemptForSignature}/${attempts} for ${currentSignature}`);
     const pseudoValidation: BatchResult = { ...implementation, status: "FAILURE", failureType: "RUNTIME_GATES_REJECTED", flags: currentFlags };
-    const bugfix = await runBugfixAgent(rootCwd, cwd, batch, config, context, pseudoValidation, currentFlags, attempt);
+    const bugfix = await runBugfixAgent(rootCwd, cwd, batch, config, context, pseudoValidation, currentFlags, totalAttempts);
     const bugfixGate = validateContract(bugfix);
     if (!bugfixGate.passed || bugfix.status !== "SUCCESS") {
       currentFlags = [...bugfixGate.flags, ...(bugfix.flags ?? []), bugfix.failureType ?? "BUGFIX_RECOVERY_FAILED"];
       continue;
     }
     await canonicalizeBatchResultManifests(cwd, batch.number);
-    recovered = await mergeRecoveredResultFromDisk(cwd, batch.number, recovered, bugfix);
+    recovered = (await importAgentResultToState(cwd, batch, "bugfix", await mergeRecoveredResultFromDisk(cwd, batch.number, recovered, bugfix))).currentResult;
     await setPhase(rootCwd, "validate", "Re-running runtime gates after gate-failure bugfix recovery");
-    const gates = await validateAll(cwd, batch, recovered, config, rootCwd);
+    const validation = await validateAllWithState(cwd, batch, recovered, config, rootCwd);
+    const gates = validation.gates;
     await setGates(rootCwd, gates);
     await writeRuntimeGates(rootCwd, batch, gates);
     if (gatesPassed(gates)) return { result: recovered, flags: [] };
@@ -553,6 +701,15 @@ async function recoverGateFailure(rootCwd: string, cwd: string, batch: Batch, co
     if (adjudication === "human") return { result: null, flags: currentFlags };
   }
   return { result: null, flags: currentFlags };
+}
+
+function failureSignature(flags: string[], failureType?: string | null): string {
+  const normalized = [failureType ?? "UNKNOWN_FAILURE", ...flags]
+    .filter(Boolean)
+    .map((flag) => flag.replace(/^RECOVERED_SOURCE_FLAG:/, ""))
+    .filter((flag) => !/_PASS$/.test(flag) && !flag.endsWith("_FIXED"))
+    .sort();
+  return normalized.join("|") || "UNKNOWN_FAILURE";
 }
 
 function requiresHumanSecurityApproval(flags: string[]): boolean {
@@ -726,10 +883,19 @@ async function runValidator(rootCwd: string, cwd: string, batch: Batch, config: 
 }
 
 async function handleRejected(cwd: string, batch: Batch, result: BatchResult, flags: string[], config: RuntimeConfig): Promise<void> {
+  await cleanupDockerForBatch(cwd, batch.number, "failure", config);
   const update = await recordFailure(cwd, batch, { ...result, flags }, config.reinforcementThreshold);
   if (update?.thresholdReached && !update.reinforced) await runReinforcement(cwd, batch, flags, config, update.key);
   await finishRuntime(cwd, "failed", `Batch ${batch.number} rejected: ${flags.join(", ")}`);
   rejectBatch(batch.number, flags);
+}
+
+async function cleanupDockerForBatch(cwd: string, batchNumber: number, outcome: "success" | "failure", config: RuntimeConfig): Promise<void> {
+  if (config.docker?.cleanupBatchResources === false) return;
+  await setPhase(cwd, "cleanup", `Cleaning Docker resources for batch ${batchNumber}`);
+  const result = await cleanupBatchDockerResources(cwd, batchNumber, outcome, config.docker);
+  if (result.skipped) await writeGate(cwd, "docker-cleanup", `batch-${String(batchNumber).padStart(3, "0")}`, "PASS", batchNumber, [`project:${result.project}`, `skipped:${result.skipped}`]);
+  else await writeGate(cwd, "docker-cleanup", `batch-${String(batchNumber).padStart(3, "0")}`, "PASS", batchNumber, [`project:${result.project}`, ...result.actions]);
 }
 
 async function runReinforcement(cwd: string, batch: Batch, flags: string[], config: RuntimeConfig, key: string): Promise<void> {

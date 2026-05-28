@@ -17,7 +17,15 @@ interface CommandInvocation {
   display: string;
 }
 
-export function execCommand(command: string, cwd: string, timeoutMs = 600000): Promise<ExecResult> {
+interface ExecOptions {
+  timeoutMs?: number;
+  heartbeatMs?: number;
+  onHeartbeat?: () => void;
+}
+
+export function execCommand(command: string, cwd: string, timeoutMsOrOptions: number | ExecOptions = 600000): Promise<ExecResult> {
+  const options = typeof timeoutMsOrOptions === "number" ? { timeoutMs: timeoutMsOrOptions } : timeoutMsOrOptions;
+  const timeoutMs = options.timeoutMs ?? 600000;
   const invocation = buildCommandInvocation(command, cwd);
   return new Promise((resolve) => {
     const child = spawn(invocation.file, invocation.args, { cwd, shell: invocation.shell, stdio: ["ignore", "pipe", "pipe"], detached: platform() !== "win32" });
@@ -29,8 +37,10 @@ export function execCommand(command: string, cwd: string, timeoutMs = 600000): P
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (heartbeat) clearInterval(heartbeat);
       resolve({ command: invocation.display, exitCode, stdout, stderr: `${stderr}${extraStderr}` });
     };
+    const heartbeat = options.onHeartbeat ? setInterval(() => options.onHeartbeat?.(), options.heartbeatMs ?? 60_000) : null;
     const timer = setTimeout(() => {
       timedOut = true;
       child.stdout.destroy();

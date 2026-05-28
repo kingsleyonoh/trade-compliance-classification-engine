@@ -1,5 +1,5 @@
 import type { BatchResult, GateResult, TestEvidence } from "../types.js";
-import { markCommand } from "../telemetry.js";
+import { markCommand, markHeartbeat } from "../telemetry.js";
 import { execCommand } from "../util/process.js";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
@@ -27,18 +27,114 @@ export async function validateCommandEvidence(cwd: string, result: BatchResult, 
       await markCommand(telemetryCwd, phase, evidence.command, "passed", 0);
       continue;
     }
-    const started = Date.now();
-    await markCommand(telemetryCwd, phase, evidence.command, "started");
-    const run = await execCommand(evidence.command, cwd, 1000 * 60 * 20);
-    const durationMs = Date.now() - started;
-    await markCommand(telemetryCwd, phase, evidence.command, run.exitCode === 0 ? "passed" : "failed", durationMs);
-    if (run.exitCode !== 0) flags.push(`COMMAND_RERUN_FAILED:${phase}:${evidence.command}:${summarizeFailure(run.stderr || run.stdout)}`);
-    else if (snapshot) recordCommandPass(cwd, phase, evidence.command, snapshot, durationMs);
+    if (snapshot && adoptedSessionCommandPassed(cwd, evidence.command)) {
+      await markCommand(telemetryCwd, `${phase}:adopted`, evidence.command, "passed", 0);
+      await markCommand(telemetryCwd, phase, evidence.command, "passed", 0);
+      recordCommandPass(cwd, phase, evidence.command, snapshot, 0);
+      continue;
+    }
+    const first = await runCommandEvidence(cwd, telemetryCwd, phase, evidence.command);
+    const retry = first.run.exitCode !== 0 && isCommandTimeout(first.run) ? await runCommandEvidence(cwd, telemetryCwd, `${phase}:timeout-retry`, evidence.command) : null;
+    const final = retry?.run.exitCode === 0 ? retry : first;
+    if (final.run.exitCode !== 0) flags.push(`COMMAND_RERUN_FAILED:${phase}:${evidence.command}:${summarizeFailure(final.run.stdout, final.run.stderr)}`);
+    else if (snapshot) recordCommandPass(cwd, phase, evidence.command, snapshot, final.durationMs);
   }
   return { name: "command-rerun", passed: flags.length === 0, flags };
 }
 
 type CommandCache = { entries: Array<{ phase: string; command: string; snapshot: string; exitCode: number; durationMs: number; completedAt: string }> };
+
+type CommandRun = { run: Awaited<ReturnType<typeof execCommand>>; durationMs: number };
+
+async function runCommandEvidence(cwd: string, telemetryCwd: string, phase: string, command: string): Promise<CommandRun> {
+  const started = Date.now();
+  await markCommand(telemetryCwd, phase, command, "started");
+  const run = await execCommand(command, cwd, {
+    timeoutMs: 1000 * 60 * 20,
+    heartbeatMs: 60_000,
+    onHeartbeat: () => void markHeartbeat(telemetryCwd, `RUNNING ${phase}: ${command}`)
+  });
+  const durationMs = Date.now() - started;
+  await markCommand(telemetryCwd, phase, command, run.exitCode === 0 ? "passed" : "failed", durationMs);
+  return { run, durationMs };
+}
+
+function isCommandTimeout(run: Awaited<ReturnType<typeof execCommand>>): boolean {
+  return run.exitCode === 124 || /COMMAND_TIMEOUT_AFTER_MS:/i.test(`${run.stderr}\n${run.stdout}`);
+}
+
+export function adoptedSessionCommandPassed(cwd: string, command: string): boolean {
+  for (const event of sessionCommandEvents(cwd).filter((item) => item.command.trim() === command.trim()).reverse()) {
+    if (!event.passed) continue;
+    if (!hasLaterSourceMutation(cwd, event.sessionFile, event.resultIndex)) return true;
+  }
+  return false;
+}
+
+type SessionCommandEvent = { sessionFile: string; resultIndex: number; command: string; passed: boolean };
+
+function sessionCommandEvents(cwd: string): SessionCommandEvent[] {
+  const dir = join(cwd, ".yolo/pi-sessions");
+  let files: string[] = [];
+  try {
+    files = readdirSync(dir).filter((file) => file.endsWith(".jsonl")).map((file) => join(dir, file));
+  } catch {
+    return [];
+  }
+  return files.flatMap((file) => parseSessionCommandEvents(file));
+}
+
+function parseSessionCommandEvents(file: string): SessionCommandEvent[] {
+  const lines = readJsonl(file);
+  const calls = new Map<string, string>();
+  const events: SessionCommandEvent[] = [];
+  lines.forEach((entry, index) => {
+    const message = entry.message;
+    if (message?.role === "assistant" && Array.isArray(message.content)) {
+      for (const block of message.content) {
+        if (block?.type === "toolCall" && block.name === "bash" && block.id) calls.set(String(block.id), String(block.arguments?.command ?? ""));
+      }
+    }
+    if (message?.role === "toolResult" && message.toolName === "bash") {
+      const command = calls.get(String(message.toolCallId));
+      if (command) events.push({ sessionFile: file, resultIndex: index, command, passed: message.isError === false });
+    }
+  });
+  return events;
+}
+
+function hasLaterSourceMutation(cwd: string, sessionFile: string, resultIndex: number): boolean {
+  const lines = readJsonl(sessionFile);
+  for (const entry of lines.slice(resultIndex + 1)) {
+    const message = entry.message;
+    if (message?.role !== "assistant" || !Array.isArray(message.content)) continue;
+    for (const block of message.content) {
+      if (block?.type !== "toolCall") continue;
+      if ((block.name === "write" || block.name === "edit") && !isYoloLocalPath(String(block.arguments?.path ?? ""))) return true;
+      if (block.name === "bash" && !isReadOnlyCommand(String(block.arguments?.command ?? ""))) return true;
+    }
+  }
+  return false;
+}
+
+function readJsonl(file: string): Array<Record<string, any>> {
+  try {
+    return readFileSync(file, "utf8").split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line) as Record<string, any>);
+  } catch {
+    return [];
+  }
+}
+
+function isYoloLocalPath(value: string): boolean {
+  return value.replace(/\\/g, "/").startsWith(".yolo/");
+}
+
+function isReadOnlyCommand(command: string): boolean {
+  const trimmed = command.trim();
+  if (!trimmed) return true;
+  if (/^(?:git\s+(?:status|diff|show|log|rev-parse)|node\s+-e\s+["'][^"']*(?:JSON\.parse|readFileSync)|test\s+-[sef]\s+|wc\s+|date\b|pwd\b|ls\b|find\b|rg\b|grep\b|cat\b|head\b|tail\b)/i.test(trimmed)) return true;
+  return false;
+}
 
 function cachedCommandPassed(cwd: string, phase: string, command: string, snapshot: string): boolean {
   const cache = readCommandCache(cwd);
@@ -116,8 +212,17 @@ function collectSnapshotFilesRec(root: string, dir: string, files: string[]): vo
   }
 }
 
-function summarizeFailure(output: string): string {
-  return output.replace(/\s+/g, " ").trim().slice(0, 220) || "no output";
+export function summarizeFailure(stdout: string, stderr = ""): string {
+  const combined = stripAnsi(`${stdout}\n${stderr}`);
+  const lines = combined.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const signalIndexes = lines.map((line, index) => /(?:fail|failed|error|exception|stacktrace|stack trace|test failed|errored|timeout|undefvar|methoderror|keyerror|argumenterror|loaderror|test summary|broken|mismatch)/i.test(line) ? index : -1).filter((index) => index >= 0);
+  const signal = signalIndexes.length ? [...new Set(signalIndexes.flatMap((index) => [index - 1, index, index + 1]).filter((index) => index >= 0 && index < lines.length))].sort((a, b) => a - b).map((index) => lines[index]) : [];
+  const selected = (signal.length ? signal : lines).slice(-12).join(" | ");
+  return selected.replace(/\s+/g, " ").trim().slice(0, 900) || "no output";
+}
+
+function stripAnsi(value: string): string {
+  return value.replace(/\u001b\[[0-9;]*m/g, "");
 }
 
 function isRunnableCommand(command: string): boolean {

@@ -3,6 +3,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+const TIE_CONFIDENCE_DELTA: f64 = 0.05;
+
 #[derive(Debug, Clone)]
 pub struct RuleRuntime {
     fuel_limit: u64,
@@ -58,6 +60,7 @@ impl RuleRuntime {
             .get("rules")
             .and_then(Value::as_array)
             .ok_or(RuleRuntimeError::InvalidRulePack)?;
+        let mut matched = Vec::new();
         let mut rejected = Vec::new();
         for rule in rules {
             let contains = rule
@@ -66,22 +69,64 @@ impl RuleRuntime {
                 .ok_or(RuleRuntimeError::InvalidRulePack)?
                 .to_ascii_lowercase();
             if haystack.contains(&contains) {
-                return Ok(RuntimeClassification {
-                    selected_code: rule.get("code").and_then(Value::as_str).map(str::to_owned),
-                    confidence: rule
-                        .get("confidence")
-                        .and_then(Value::as_f64)
-                        .unwrap_or(0.0),
-                    risk_band: rule
-                        .get("risk_band")
-                        .and_then(Value::as_str)
-                        .unwrap_or("medium")
-                        .to_owned(),
-                    matched_rules: vec![rule.clone()],
-                    rejected_candidates: rejected,
-                });
+                matched.push(rule.clone());
+            } else {
+                rejected.push(json!({
+                    "code": rule.get("code").cloned().unwrap_or(Value::Null),
+                    "rule_id": rule.get("id").cloned().unwrap_or(Value::Null),
+                    "reason": "contains_not_matched"
+                }));
             }
-            rejected.push(json!({"rule_id": rule.get("id").cloned().unwrap_or(Value::Null), "reason": "contains_not_matched"}));
+        }
+        matched.sort_by(|left, right| {
+            let left_confidence = left
+                .get("confidence")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            let right_confidence = right
+                .get("confidence")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            right_confidence.total_cmp(&left_confidence)
+        });
+        if let Some(selected) = matched.first() {
+            let selected_confidence = selected
+                .get("confidence")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            for rule in matched.iter().skip(1) {
+                let rule_confidence = rule
+                    .get("confidence")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0);
+                let reason = if selected_confidence - rule_confidence <= TIE_CONFIDENCE_DELTA {
+                    "tie_score"
+                } else {
+                    "lower_score"
+                };
+                rejected.push(json!({
+                    "code": rule.get("code").cloned().unwrap_or(Value::Null),
+                    "rule_id": rule.get("id").cloned().unwrap_or(Value::Null),
+                    "reason": reason
+                }));
+            }
+            return Ok(RuntimeClassification {
+                selected_code: selected
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                confidence: selected
+                    .get("confidence")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0),
+                risk_band: selected
+                    .get("risk_band")
+                    .and_then(Value::as_str)
+                    .unwrap_or("medium")
+                    .to_owned(),
+                matched_rules: vec![selected.clone()],
+                rejected_candidates: rejected,
+            });
         }
         Ok(RuntimeClassification {
             selected_code: None,

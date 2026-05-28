@@ -25,6 +25,7 @@ export function normalizeBatchResult(raw: unknown, fallbackBatch = 0): BatchResu
   const shapeFlags = malformedShapeFlags(data);
   const status = typeof data.status === "string" ? data.status as BatchResult["status"] : "INVALID_RESULT";
   return {
+    ...preserveExtraContractFields(data),
     schemaVersion: typeof data.schemaVersion === "number" ? data.schemaVersion : 0,
     agent: isAgent(data.agent) ? data.agent : "implement",
     batch: normalizeBatch(data.batch, fallbackBatch),
@@ -62,6 +63,18 @@ export function validateContract(result: BatchResult): GateResult {
   if (result.projectLocalChecks && "triggered" in result.projectLocalChecks && !Array.isArray(result.projectLocalChecks.triggered)) flags.push("INVALID_PROJECT_LOCAL_CHECKS_SHAPE");
   if (result.artifacts && !Array.isArray(result.artifacts)) flags.push("INVALID_ARTIFACTS_SHAPE");
   return { name: "contract", passed: flags.length === 0, flags };
+}
+
+function preserveExtraContractFields(data: Record<string, unknown>): Record<string, unknown> {
+  const normalized = new Set(["schemaVersion", "agent", "batch", "status", "itemsCompleted", "filesChanged", "tests", "wiring", "projectLocalChecks", "businessLogic", "artifacts", "localOnlyFiles", "inbox", "failureType", "flags", "commit"]);
+  return Object.fromEntries(Object.entries(data).filter(([key, value]) => !normalized.has(key) && isJsonValue(value)));
+}
+
+function isJsonValue(value: unknown): boolean {
+  if (value === null || ["string", "number", "boolean"].includes(typeof value)) return true;
+  if (Array.isArray(value)) return value.every(isJsonValue);
+  if (value && typeof value === "object") return Object.values(value as Record<string, unknown>).every(isJsonValue);
+  return false;
 }
 
 function malformedShapeFlags(data: Record<string, unknown>): string[] {

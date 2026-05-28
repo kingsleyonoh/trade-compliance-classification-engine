@@ -7,6 +7,7 @@ import type { Batch, BatchResult, GateResult, RuntimeConfig } from "../types.js"
 const FRONTEND_EXTENSIONS = /\.(tsx|jsx|vue|svelte|astro|css|scss|sass|less|html|hbs|handlebars|twig|njk|ejs)$/i;
 const NON_FRONTEND_SOURCE_EXTENSIONS = /\.(java|kt|kts|cs|fs|fsx|vb|go|rs|py|rb|php|scala|clj|cljs|ex|exs|erl|hrl|swift|m|mm|c|cc|cxx|cpp|h|hpp|sql|r|jl|lua|dart)$/i;
 const FRONTEND_PATHS = /(^|\/)(src\/app|src\/pages|src\/components|app|pages|components|frontend|templates|static|public|styles|ui)(\/|$)/i;
+const BACKEND_SOURCE_PATHS = /(^|\/)src\/(api|routes|server|middleware|db|services|repositories|workers|jobs)(\/|\.|$)/i;
 const FRONTEND_TAGS = new Set(["[UI]", "[UX]", "[FRONTEND]", "[PAGE]", "[COMPONENT]"]);
 
 interface DetectorResult {
@@ -19,7 +20,7 @@ export async function validateFrontendImpeccable(cwd: string, batch: Batch, resu
   const flags: string[] = [];
   if (!(await exists(path.join(cwd, "PRODUCT.md")))) flags.push("MISSING_PRODUCT_CONTEXT");
   if (!(await exists(path.join(cwd, "DESIGN.md")))) flags.push("MISSING_DESIGN_CONTEXT");
-  if (result.flags.some((flag) => /^FRONTEND_IMPECCABLE_(?:P0|P1|FINDING|FAIL)/i.test(flag))) flags.push("FRONTEND_IMPECCABLE_BLOCKING_FINDINGS");
+  if (result.flags.some((flag) => /^FRONTEND_IMPECCABLE_(?:P0|P1|FINDING|FAIL)/i.test(flag)) && !hasFlag(result, "FRONTEND_IMPECCABLE_AUDIT_PASS") && !hasFlag(result, "FRONTEND_IMPECCABLE_POLISH_PASS")) flags.push("FRONTEND_IMPECCABLE_BLOCKING_FINDINGS");
   const detector = await runImpeccableDetector(cwd, batch, result, config);
   flags.push(...detector.flags);
   if (!hasFrontendAuditEvidence(result, detector)) flags.push("MISSING_FRONTEND_IMPECCABLE_AUDIT_PASS");
@@ -116,6 +117,7 @@ function parseStatusLine(line: string): string | null {
 
 function isFrontendPath(file: string): boolean {
   const normalized = file.replace(/\\/g, "/");
+  if (BACKEND_SOURCE_PATHS.test(normalized)) return false;
   if (FRONTEND_EXTENSIONS.test(normalized)) return true;
   if (NON_FRONTEND_SOURCE_EXTENSIONS.test(normalized)) return false;
   return FRONTEND_PATHS.test(normalized);

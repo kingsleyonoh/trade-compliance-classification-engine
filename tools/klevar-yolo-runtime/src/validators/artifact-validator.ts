@@ -23,8 +23,7 @@ export async function validateArtifacts(cwd: string, result: BatchResult): Promi
 }
 
 function artifactPath(artifact: unknown): string | null {
-  if (typeof artifact === "string") return artifact;
-  if (!artifact || typeof artifact !== "object") return null;
-  const record = artifact as Record<string, unknown>;
-  return typeof record.path === "string" ? record.path : typeof record.file === "string" ? record.file : null;
+  const value = typeof artifact === "string" ? artifact : artifact && typeof artifact === "object" ? (artifact as Record<string, unknown>).path ?? (artifact as Record<string, unknown>).file : null;
+  if (typeof value !== "string") return null;
+  return /^(?:unknown|n\/?a|not applicable|none|manual|tbd|todo|-)$/i.test(value.trim()) ? null : value;
 }

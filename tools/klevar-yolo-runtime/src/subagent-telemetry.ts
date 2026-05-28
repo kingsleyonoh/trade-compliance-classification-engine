@@ -8,6 +8,10 @@ export interface SubagentTelemetry {
   role: string;
   model?: string;
   thinking?: string;
+  requestedModel?: string;
+  requestedThinking?: string;
+  sessionModel?: string;
+  sessionThinking?: string;
   status: "running" | "stale" | "timeout" | "retrying" | "failed" | "complete";
   startedAt: string;
   updatedAt: string;
@@ -66,7 +70,11 @@ export async function summarizeSubagentSession(invocation: SubagentInvocation, s
     id: invocation.id,
     role: invocation.role,
     model: invocation.route.model,
-    thinking: invocation.route.thinking ?? "high",
+    thinking: invocation.route.thinking ?? "medium",
+    requestedModel: invocation.route.model,
+    requestedThinking: invocation.route.thinking ?? "medium",
+    sessionModel: parsed.sessionModel,
+    sessionThinking: parsed.sessionThinking,
     status: warnings.some((warning) => warning.startsWith("AGENT_STALE")) ? "stale" : "running",
     startedAt,
     updatedAt: new Date().toISOString(),
@@ -106,6 +114,8 @@ async function parseSession(file: string): Promise<{
   completionTokens?: number;
   totalTokens?: number;
   estimatedCost?: number;
+  sessionModel?: string;
+  sessionThinking?: string;
 }> {
   if (!(await exists(file))) return { toolCalls: 0, toolResults: 0 };
   const lines = (await readFile(file, "utf8")).split(/\r?\n/).filter(Boolean).slice(-300);
@@ -120,12 +130,17 @@ async function parseSession(file: string): Promise<{
   let completionTokens = 0;
   let totalTokens = 0;
   let estimatedCost = 0;
+  let sessionModel: string | undefined;
+  let sessionThinking: string | undefined;
   for (const line of lines) {
     try {
       const entry = JSON.parse(line) as Record<string, any>;
       const timestamp = typeof entry.timestamp === "string" ? Date.parse(entry.timestamp) : NaN;
       if (Number.isFinite(timestamp)) lastActivityMs = timestamp;
+      if (entry.type === "thinking_level_change" && typeof entry.thinkingLevel === "string") sessionThinking = entry.thinkingLevel;
+      if (entry.type === "model_change" && typeof entry.modelId === "string") sessionModel = typeof entry.provider === "string" ? `${entry.provider}/${entry.modelId}` : entry.modelId;
       const message = entry.message;
+      if (message?.provider && message?.model) sessionModel = `${message.provider}/${message.model}`;
       const usage = message?.usage ?? entry.usage;
       if (usage) {
         promptTokens += Number(usage.input ?? usage.promptTokens ?? 0);
@@ -152,7 +167,7 @@ async function parseSession(file: string): Promise<{
       // Ignore partial JSONL writes.
     }
   }
-  return { lastTool, lastCommand, lastFile, lastResult, lastActivityMs, toolCalls, toolResults, promptTokens, completionTokens, totalTokens, estimatedCost };
+  return { lastTool, lastCommand, lastFile, lastResult, lastActivityMs, toolCalls, toolResults, promptTokens, completionTokens, totalTokens, estimatedCost, sessionModel, sessionThinking };
 }
 
 function summarizeResult(content: unknown): string {

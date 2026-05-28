@@ -25,7 +25,7 @@ export async function runSubagent(invocation: SubagentInvocation): Promise<Batch
     try {
       await appendSubagentEvent(invocation.cwd, invocation.id, { type: "agent_attempt_started", role: invocation.role, attempt, sessionFile: rel(invocation.cwd, sessionFile) });
       await clearSubagentOutput(invocation.cwd, invocation.outputBase);
-      await runAgent({ cwd: invocation.cwd, sessionFile, prompt, route: invocation.route });
+      await runAgent({ cwd: invocation.cwd, sessionFile, prompt, route: invocation.route, staleToolTimeoutMs: budget.staleMs });
       stopHeartbeat();
       if (invocation.telemetryRoot) await markTiming(invocation.telemetryRoot, `${invocation.role}AgentMs`, Date.now() - startedMs);
       const result = await readCanonicalBatchResult(resultFile);

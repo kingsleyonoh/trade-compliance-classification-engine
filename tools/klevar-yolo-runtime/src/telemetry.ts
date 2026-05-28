@@ -4,7 +4,7 @@ import { ensureDir, exists, writeText } from "./util/fs.js";
 import { notifyRuntimeFinish } from "./notifications.js";
 import type { GateResult } from "./types.js";
 
-export type RuntimePhase = "idle" | "select" | "worktree" | "knowledge" | "implement" | "validate" | "bugfix" | "journal" | "merge" | "commit" | "failed" | "complete";
+export type RuntimePhase = "idle" | "select" | "worktree" | "knowledge" | "implement" | "validate" | "bugfix" | "journal" | "merge" | "cleanup" | "commit" | "failed" | "complete";
 
 export interface RuntimeState {
   schemaVersion: 1;
@@ -42,13 +42,13 @@ export async function resetRuntimeState(cwd: string, batch: number, requestedSco
 }
 
 export async function setPhase(cwd: string, phase: RuntimePhase, message: string, extra: Partial<RuntimeState> = {}): Promise<void> {
-  const runningPhases: RuntimePhase[] = ["select", "worktree", "knowledge", "implement", "validate", "bugfix", "journal", "merge", "commit"];
+  const runningPhases: RuntimePhase[] = ["select", "worktree", "knowledge", "implement", "validate", "bugfix", "journal", "merge", "cleanup", "commit"];
   const status = runningPhases.includes(phase) ? "running" : phase === "complete" ? "complete" : phase === "failed" ? "failed" : undefined;
   const state = await readState(cwd);
   const checkpoint = checkpointForPhase(phase);
   const checkpointStatus: "failed" | "running" | "passed" = phase === "failed" ? "failed" : phase === "complete" ? "passed" : "running";
   const checkpoints = checkpoint ? { ...defaultCheckpoints(), ...(state.checkpoints ?? {}), [checkpoint]: checkpointStatus } : state.checkpoints;
-  await patchState(cwd, { ...(status ? { status } : {}), ...(checkpoints ? { checkpoints } : {}), phase, lastEvent: message, ...extra });
+  await patchState(cwd, { ...(status ? { status } : {}), ...(checkpoints ? { checkpoints } : {}), phase, lastEvent: message, ...extra, ...(extra.inspect ? { inspect: { ...(state.inspect ?? {}), ...extra.inspect } } : {}) });
   await appendEvent(cwd, { type: "phase", phase, message });
 }
 

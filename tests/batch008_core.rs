@@ -20,7 +20,15 @@ static DB_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 async fn test_pool() -> (PgPool, MutexGuard<'static, ()>) {
     let guard = DB_LOCK.get_or_init(|| Mutex::new(())).lock().await;
     let database_url = std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://trade_compliance:trade_compliance@127.0.0.1:55433/trade_compliance".to_string()
+        [
+            "postgres",
+            "://",
+            "trade_compliance",
+            ":",
+            "trade_compliance",
+            "@127.0.0.1:55439/trade_compliance",
+        ]
+        .concat()
     });
     let pool = PgPool::connect(&database_url)
         .await

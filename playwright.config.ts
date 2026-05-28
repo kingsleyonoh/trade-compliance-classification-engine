@@ -11,7 +11,7 @@ function localDockerDatabaseUrl(): string {
     "trade_compliance",
     ":",
     "trade_compliance",
-    "@127.0.0.1:55433/trade_compliance",
+    "@127.0.0.1:55439/trade_compliance",
   ].join("");
 }
 
@@ -51,7 +51,7 @@ export default defineConfig({
   webServer: {
     command: "cargo run --bin trade-compliance-classification-engine",
     url: playwrightBaseUrl,
-    reuseExistingServer: false,
+    reuseExistingServer: true,
     timeout: 300_000,
     env: {
       DATABASE_URL: playwrightDatabaseUrl,
