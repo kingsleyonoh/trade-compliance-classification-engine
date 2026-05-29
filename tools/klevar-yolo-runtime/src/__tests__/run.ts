@@ -1329,13 +1329,15 @@ test("validation policy classifies critical and low risk batches", () => {
   assert.equal(validationPolicyFor(critical, implementResult(), { ...defaultConfig, validationMode: "fast" }).requireAdversarialValidation, true);
 });
 
-test("runtime source uses canonical batch state and runtime lock", async () => {
+test("runtime source uses canonical batch state and blocks open findings", async () => {
   const source = await readFileText(join(process.cwd(), "src/runtime.ts"));
   assert.match(source, /importAgentResultToState/);
   assert.match(source, /recordGateState/);
   assert.match(source, /acquireRuntimeLock/);
   assert.match(source, /heartbeatRuntimeLock/);
   assert.match(source, /releaseRuntimeLock/);
+  assert.match(source, /gatesPassed\(gates\) && openFindings\.length > 0/);
+  assert.match(source, /handleRejected\(cwd, batch, result, openFindings\.map/);
 });
 
 test("artifact validator ignores placeholder artifact paths", async () => {
@@ -1650,11 +1652,14 @@ test("agent session detects stale unanswered tool calls", () => {
   assert.equal(staleUnansweredToolReason(completedToolCall, now, 30 * 60_000), undefined);
 });
 
-test("subagent runner starts from a fresh session file on rerun", async () => {
+test("subagent runner converts stale tool timeouts into synthetic failure results", async () => {
   const source = await readFileText(join(process.cwd(), "src/subagent-runner.ts"));
   assert.match(source, /rm\(sessionFile, \{ force: true \}\)/);
   assert.match(source, /clearSubagentOutput\(invocation\.cwd, invocation\.outputBase\)/);
   assert.match(source, /staleToolTimeoutMs: budget\.staleMs/);
+  assert.match(source, /isRecoverableAgentTimeout\(error\)/);
+  assert.match(source, /writeSyntheticFailureResult\(invocation, error\)/);
+  assert.match(source, /AGENT_STALE_TOOL_TIMEOUT/);
 });
 
 test("default model routes cap guarded roles at medium thinking", () => {

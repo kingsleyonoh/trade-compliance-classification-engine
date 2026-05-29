@@ -148,8 +148,9 @@ async fn classify_legacy_product_job(
         .unwrap_or("US")
         .to_owned();
     let outcome = evaluate_pack(&pack.get::<Value, _>("payload"), &product_snapshot)?;
+    let decision = outcome_decision(&outcome);
     let candidates = json!({"matched_rules": outcome.matched_rules, "rejected_candidates": outcome.rejected_candidates});
-    sqlx::query("INSERT INTO classification_runs (tenant_id, product_id, rule_pack_id, jurisdiction, product_snapshot, input_snapshot, rule_pack_version, candidates, candidate_codes, selected_code, confidence, risk_band, explanation, status, started_at, finished_at, updated_at) VALUES ($1,$2,$3,$4,$5,$5,$6,$7,$8,$9,$10,$11,$12,'classified',now(),now(),now())")
+    sqlx::query("INSERT INTO classification_runs (tenant_id, product_id, rule_pack_id, jurisdiction, product_snapshot, input_snapshot, rule_pack_version, candidates, candidate_codes, selected_code, confidence, risk_band, explanation, failure_reason, status, started_at, finished_at, updated_at) VALUES ($1,$2,$3,$4,$5,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,now(),now(),now())")
         .bind(tenant_id)
         .bind(product_id)
         .bind(pack.get::<uuid::Uuid, _>("id"))
@@ -157,14 +158,64 @@ async fn classify_legacy_product_job(
         .bind(product_snapshot)
         .bind(pack.get::<String, _>("version"))
         .bind(candidates)
-        .bind(json!(outcome.selected_code.iter().collect::<Vec<_>>()))
+        .bind(candidate_codes(&outcome))
         .bind(outcome.selected_code)
         .bind(outcome.confidence)
         .bind(outcome.risk_band)
         .bind(json!({"runtime":"deterministic_wasm_stub"}))
+        .bind(decision.failure_reason)
+        .bind(decision.status)
         .execute(pool)
         .await?;
     Ok(())
+}
+
+struct OutcomeDecision {
+    status: &'static str,
+    failure_reason: Option<&'static str>,
+}
+
+fn candidate_codes(outcome: &crate::rules::wasm_runtime::RuntimeClassification) -> Value {
+    let mut codes = outcome.selected_code.iter().cloned().collect::<Vec<_>>();
+    codes.extend(
+        outcome
+            .rejected_candidates
+            .iter()
+            .filter_map(|candidate| candidate.get("code").and_then(Value::as_str))
+            .map(str::to_owned),
+    );
+    json!(codes)
+}
+
+fn outcome_decision(
+    outcome: &crate::rules::wasm_runtime::RuntimeClassification,
+) -> OutcomeDecision {
+    if outcome.selected_code.is_none() {
+        return OutcomeDecision {
+            status: "blocked",
+            failure_reason: Some("no_candidate"),
+        };
+    }
+    if outcome
+        .rejected_candidates
+        .iter()
+        .any(|candidate| candidate.get("reason").and_then(Value::as_str) == Some("tie_score"))
+    {
+        return OutcomeDecision {
+            status: "needs_review",
+            failure_reason: Some("tie_candidate"),
+        };
+    }
+    if outcome.confidence < 0.82 {
+        return OutcomeDecision {
+            status: "needs_review",
+            failure_reason: Some("low_confidence"),
+        };
+    }
+    OutcomeDecision {
+        status: "classified",
+        failure_reason: None,
+    }
 }
 
 fn evaluate_pack(
@@ -195,17 +246,20 @@ async fn persist_run_outcome(
         .and_then(Value::as_str)
         .unwrap_or("US")
         .to_owned();
-    sqlx::query("UPDATE classification_runs SET rule_pack_id=$1, jurisdiction=$2, product_snapshot=$3, input_snapshot=$3, rule_pack_version=$4, candidates=$5, candidate_codes=$6, selected_code=$7, confidence=$8, risk_band=$9, explanation=$10, status='classified', started_at=COALESCE(started_at, now()), finished_at=now(), updated_at=now() WHERE tenant_id=$11 AND id=$12 AND status NOT IN ('classified','completed')")
+    let decision = outcome_decision(&outcome);
+    sqlx::query("UPDATE classification_runs SET rule_pack_id=$1, jurisdiction=$2, product_snapshot=$3, input_snapshot=$3, rule_pack_version=$4, candidates=$5, candidate_codes=$6, selected_code=$7, confidence=$8, risk_band=$9, explanation=$10, failure_reason=$11, status=$12, started_at=COALESCE(started_at, now()), finished_at=now(), updated_at=now() WHERE tenant_id=$13 AND id=$14 AND status NOT IN ('classified','completed','needs_review','blocked','failed')")
         .bind(pack.get::<uuid::Uuid, _>("id"))
         .bind(jurisdiction)
         .bind(input_snapshot)
         .bind(pack.get::<String, _>("version"))
         .bind(candidates)
-        .bind(json!(outcome.selected_code.iter().collect::<Vec<_>>()))
+        .bind(candidate_codes(&outcome))
         .bind(outcome.selected_code)
         .bind(outcome.confidence)
         .bind(outcome.risk_band)
         .bind(json!({"runtime":"deterministic_wasm_stub"}))
+        .bind(decision.failure_reason)
+        .bind(decision.status)
         .bind(tenant_id)
         .bind(run_id)
         .execute(pool)

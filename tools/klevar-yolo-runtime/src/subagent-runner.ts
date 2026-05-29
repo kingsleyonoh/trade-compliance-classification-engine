@@ -37,7 +37,10 @@ export async function runSubagent(invocation: SubagentInvocation): Promise<Batch
       lastError = error;
       await emitTelemetry(invocation, sessionFile, startedMs, startedAt, attempt, budget, attempt <= maxRetries ? "retrying" : "failed", undefined, error);
       await appendSubagentEvent(invocation.cwd, invocation.id, { type: attempt <= maxRetries ? "agent_attempt_retry" : "agent_attempt_failed", role: invocation.role, attempt, error: String(error instanceof Error ? error.message : error) });
-      if (attempt > maxRetries) throw error;
+      if (attempt > maxRetries) {
+        if (isRecoverableAgentTimeout(error)) return await writeSyntheticFailureResult(invocation, error);
+        throw error;
+      }
     }
   }
   throw lastError instanceof Error ? lastError : new Error(String(lastError ?? "Subagent failed"));
@@ -71,6 +74,39 @@ async function emitTelemetry(invocation: SubagentInvocation, sessionFile: string
   if (error) telemetry.warnings.push(`AGENT_ERROR:${String(error instanceof Error ? error.message : error).slice(0, 200)}`);
   await writeSubagentTelemetry(invocation.cwd, telemetry);
   return telemetry;
+}
+
+function isRecoverableAgentTimeout(error: unknown): boolean {
+  const message = String(error instanceof Error ? error.message : error);
+  return /^AGENT_(?:STALE_TOOL_TIMEOUT|TIMEOUT):/.test(message);
+}
+
+async function writeSyntheticFailureResult(invocation: SubagentInvocation, error: unknown): Promise<BatchResult> {
+  const message = String(error instanceof Error ? error.message : error);
+  const failureType = message.startsWith("AGENT_STALE_TOOL_TIMEOUT:") ? "AGENT_STALE_TOOL_TIMEOUT" : "AGENT_TIMEOUT";
+  const batch = extractBatch(invocation.id);
+  const result: BatchResult = {
+    schemaVersion: 1,
+    agent: invocation.role,
+    batch,
+    status: "FAILURE",
+    itemsCompleted: [],
+    filesChanged: [`${invocation.outputBase}.md`, `${invocation.outputBase}.json`],
+    tests: {
+      regression: { command: "not applicable", exitCode: 1, evidence: message }
+    },
+    wiring: { required: false, entrypoints: [] },
+    projectLocalChecks: { evaluated: 0, triggered: [], notes: "agent did not complete" },
+    artifacts: [{ path: `${invocation.outputBase}.md`, description: "synthetic failure report" }],
+    localOnlyFiles: [],
+    inbox: { handledTitles: [] },
+    failureType,
+    flags: [failureType],
+    commit: null
+  };
+  await writeText(path.join(invocation.cwd, `${invocation.outputBase}.md`), `# ${failureType}\n\n${message}\n`);
+  await writeText(path.join(invocation.cwd, `${invocation.outputBase}.json`), JSON.stringify(result, null, 2) + "\n");
+  return result;
 }
 
 function formatDuration(ms: number): string {

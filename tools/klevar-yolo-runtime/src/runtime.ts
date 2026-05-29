@@ -111,6 +111,11 @@ async function runSingleBatch(cwd: string, config: RuntimeConfig, scope: YoloSco
   await appendJournal(cwd, batch, result, gates);
   const openFindings = blockingOpenFindings(validation.state);
   if (!gatesPassed(gates) && openFindings.length === 0) await writeGate(cwd, "findings", `batch-${String(batch.number).padStart(3, "0")}`, "PASS", batch.number, ["no open blocking canonical findings"]);
+  if (gatesPassed(gates) && openFindings.length > 0) {
+    await markRuntimeClaim(cwd, config, batch, "blocked");
+    await handleRejected(cwd, batch, result, openFindings.map((finding) => finding.id), config);
+    return "failed";
+  }
   const adjudication = !gatesPassed(gates) ? await adjudicateIfPossible(cwd, lease.cwd, batch, config, context, result, gates) : "none";
   if (adjudication === "accepted") {
     await setCheckpoint(cwd, "runtimeGates", "passed");

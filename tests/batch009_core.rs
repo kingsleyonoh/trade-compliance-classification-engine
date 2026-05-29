@@ -7,8 +7,8 @@ use std::sync::OnceLock;
 use tokio::sync::{Mutex, MutexGuard};
 use tower::ServiceExt;
 use trade_compliance_classification_engine::app::{app, AppState};
-use trade_compliance_classification_engine::auth::hash_api_key;
 use trade_compliance_classification_engine::auth::policies::*;
+use trade_compliance_classification_engine::auth::{hash_api_key, UserScope};
 use trade_compliance_classification_engine::classification::service::classify_queued_products;
 use trade_compliance_classification_engine::jobs::lease::lease_classification_jobs;
 use trade_compliance_classification_engine::rules::wasm_runtime::RuleRuntime;
@@ -411,6 +411,83 @@ async fn classification_run_api_denies_auditors_and_rejects_unready_products() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["error"]["code"], "product_not_ready");
+}
+
+#[tokio::test]
+async fn role_policy_denied_cells_reach_api_or_future_endpoint_guards() {
+    let (pool, _guard) = test_pool().await;
+    let app = app(test_state(pool.clone()));
+
+    let classifier_key = register_tenant(
+        app.clone(),
+        "Classifier Denial Tenant",
+        "classifier-denial@example.test",
+    )
+    .await;
+    sqlx::query("UPDATE users SET scope='classifier' WHERE email='classifier-denial@example.test'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let reviewer_key = register_tenant(
+        app.clone(),
+        "Reviewer Denial Tenant",
+        "reviewer-denial@example.test",
+    )
+    .await;
+    sqlx::query("UPDATE users SET scope='reviewer' WHERE email='reviewer-denial@example.test'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    for (scope, api_key, path, payload) in [
+        (
+            "classifier",
+            classifier_key.as_str(),
+            "/api/rule-packs",
+            json!({"name":"classifier-denied","version":"2026.denied","jurisdiction":"US","source":"{}"}),
+        ),
+        (
+            "reviewer",
+            reviewer_key.as_str(),
+            "/api/products/import",
+            json!({"rows":[{"sku":"REVIEWER-DENIED","name":"Denied","description":"Denied write","country_of_origin":"NG","jurisdiction":"US","product_type":"apparel","materials":["cotton"],"intended_use":"retail sale"}]}),
+        ),
+        (
+            "reviewer",
+            reviewer_key.as_str(),
+            "/api/classifications/run",
+            json!({"product_ids":[]}),
+        ),
+        (
+            "reviewer",
+            reviewer_key.as_str(),
+            "/api/rule-packs",
+            json!({"name":"reviewer-denied","version":"2026.denied","jurisdiction":"US","source":"{}"}),
+        ),
+    ] {
+        let (status, body) = request_json(app.clone(), post_json(path, api_key, payload)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{scope} {path}: {body}");
+        assert_eq!(body["error"]["code"], "insufficient_scope");
+    }
+
+    // Future Phase 2 API surfaces are still represented by the same matrix gate here:
+    // scope='classifier' classifier override denied: classifier overrides.create insufficient_scope
+    // scope='classifier' classifier settings denied: classifier settings.manage insufficient_scope
+    // scope='reviewer' reviewer settings denied: reviewer settings.manage insufficient_scope
+    // scope='auditor' auditor override denied: auditor overrides.create insufficient_scope
+    // scope='auditor' auditor settings denied: auditor settings.manage insufficient_scope
+    for (scope, action) in [
+        (UserScope::Classifier, ResourceAction::OverridesCreate),
+        (UserScope::Classifier, ResourceAction::SettingsManage),
+        (UserScope::Reviewer, ResourceAction::SettingsManage),
+        (UserScope::Auditor, ResourceAction::OverridesCreate),
+        (UserScope::Auditor, ResourceAction::SettingsManage),
+    ] {
+        assert!(
+            !can_scope(scope, action),
+            "future endpoint authorization gate must deny {scope:?} for {action:?}"
+        );
+    }
 }
 
 #[test]
