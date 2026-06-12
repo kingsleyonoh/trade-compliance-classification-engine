@@ -9,11 +9,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::ui;
 use crate::{errors::ApiError, search::index::ProductSearchIndex, telemetry::MetricsRegistry};
 
+pub mod audit_exports;
 pub mod classifications;
 pub mod health;
 pub mod products;
+pub mod reviews;
 pub mod rule_packs;
 pub mod tenants;
 
@@ -85,6 +88,16 @@ impl RegistrationLimiter {
 }
 
 pub fn app(state: AppState) -> Router {
+    all_routes().with_state(state)
+}
+
+fn all_routes() -> Router<AppState> {
+    ui_routes(rule_pack_routes(audit_routes(classification_routes(
+        product_routes(base_routes()),
+    ))))
+}
+
+fn base_routes() -> Router<AppState> {
     Router::new()
         .route(
             "/",
@@ -96,9 +109,17 @@ pub fn app(state: AppState) -> Router {
         .route("/metrics", get(health::metrics))
         .route("/tenants/me", get(tenants::me))
         .route("/api/tenants/register", post(tenants::register))
+}
+
+fn product_routes(router: Router<AppState>) -> Router<AppState> {
+    router
         .route("/api/products", get(products::list_products))
         .route("/api/products/import", post(products::import_products))
         .route("/api/products/:id", get(products::get_product))
+}
+
+fn classification_routes(router: Router<AppState>) -> Router<AppState> {
+    router
         .route(
             "/api/classifications/run",
             post(classifications::run_classifications),
@@ -111,6 +132,39 @@ pub fn app(state: AppState) -> Router {
             "/api/classifications/:id",
             get(classifications::get_classification),
         )
+        .route(
+            "/api/classifications/:id/override",
+            post(classifications::create_override),
+        )
+        .route("/api/reviews", get(reviews::review_queue))
+}
+
+fn audit_routes(router: Router<AppState>) -> Router<AppState> {
+    router
+        .route(
+            "/api/audit-exports",
+            post(audit_exports::create_audit_export),
+        )
+        .route(
+            "/api/audit-exports/:id/download",
+            get(audit_exports::download_audit_export),
+        )
+}
+
+fn ui_routes(router: Router<AppState>) -> Router<AppState> {
+    router
+        .route("/ui/dashboard", get(ui::dashboard))
+        .route("/ui/products/import", get(ui::product_import))
+        .route("/ui/products", get(ui::products))
+        .route("/ui/classifications/detail", get(ui::classification_detail))
+        .route("/ui/rule-packs", get(ui::rule_packs))
+        .route("/ui/reviews", get(ui::reviews))
+        .route("/ui/audit-exports", get(ui::audit_exports))
+        .route("/ui/integrations", get(ui::integrations))
+}
+
+fn rule_pack_routes(router: Router<AppState>) -> Router<AppState> {
+    router
         .route("/api/rule-packs", post(rule_packs::upload_rule_pack))
         .route("/api/rule-packs/upload", post(rule_packs::upload_rule_pack))
         .route(
@@ -121,5 +175,4 @@ pub fn app(state: AppState) -> Router {
             "/api/rule-packs/:id/activate",
             post(rule_packs::activate_rule_pack),
         )
-        .with_state(state)
 }

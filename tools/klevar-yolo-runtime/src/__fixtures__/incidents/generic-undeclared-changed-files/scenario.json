@@ -1,0 +1,7 @@
+{
+  "kind": "worktree-sync",
+  "candidatePaths": [
+    "src/runtime/classified.ts"
+  ],
+  "expectedErrorIncludes": "WORKTREE_CHANGED_FILES_UNDECLARED:src/runtime/untracked.ts"
+}

@@ -96,6 +96,17 @@ fn playwright_framework_is_configured_for_real_http() {
     assert!(package.contains("@playwright/test"));
     assert!(package.contains("test:e2e"));
     assert!(config.contains("webServer"));
+    assert!(
+        config.contains("scripts/playwright-webserver.mjs"),
+        "Playwright must launch the Rust server through the env-normalizing webServer script"
+    );
+    let launcher = fs::read_to_string("scripts/playwright-webserver.mjs")
+        .expect("Playwright webServer launcher script should exist");
+    assert!(
+        !config.contains("process.env.TEST_DATABASE_URL")
+            && !launcher.contains("process.env.TEST_DATABASE_URL"),
+        "Playwright E2E must not inherit TEST_DATABASE_URL from serialized cargo-test reruns"
+    );
     assert!(smoke.contains("request.get"));
 }
 
@@ -132,6 +143,91 @@ fn playwright_default_bind_port_is_not_fixed() {
         !config.contains("http://127.0.0.1:18080") && !config.contains("127.0.0.1:18080"),
         "Playwright config must not default to a fixed loopback port that can be denied or collide during runtime reruns"
     );
+}
+
+#[test]
+fn playwright_webserver_rejects_credentialless_database_urls() {
+    let launcher = fs::read_to_string("scripts/playwright-webserver.mjs")
+        .expect("Playwright webServer launcher script should exist");
+
+    assert!(
+        launcher.contains("runtimeUsableDatabaseUrl"),
+        "Playwright launcher must validate runtime DATABASE_URL values before passing them to sqlx"
+    );
+    assert!(
+        launcher.contains("database.username") && launcher.contains("database.password"),
+        "Playwright launcher must reject credential-less PostgreSQL URLs so libpq cannot derive the OS user during validator reruns"
+    );
+    assert!(
+        launcher.contains("localDockerDatabaseUrl()"),
+        "Playwright launcher must fall back to the local docker-compose database URL when DATABASE_URL is empty or credential-less"
+    );
+}
+
+#[test]
+fn playwright_smoke_mutates_database_without_compose_service_exec() {
+    let smoke = fs::read_to_string("tests/e2e/smoke.spec.ts").expect("smoke spec should exist");
+
+    assert!(
+        smoke.contains("function runSql"),
+        "Playwright smoke tests must mutate database state through the configured DB connection"
+    );
+    assert!(
+        !smoke.contains("compose") && !smoke.contains("exec\",\n      \"-T\",\n      \"postgres"),
+        "Playwright smoke tests must not depend on this worktree's docker compose service name"
+    );
+}
+
+#[test]
+fn phase_closeout_audit_remains_last_in_each_completed_phase() {
+    let progress = fs::read_to_string("docs/progress.md").expect("progress ledger should exist");
+    let phase_1 = progress
+        .split("## Phase 1: Core Tenant + Classification Loop")
+        .nth(1)
+        .and_then(|rest| rest.split("## Phase 2:").next())
+        .expect("Phase 1 section should exist");
+    let last_item = phase_1
+        .lines()
+        .rfind(|line| line.starts_with("- ["))
+        .expect("Phase 1 should contain progress items");
+
+    assert!(
+        last_item.contains("[AUDIT] Phase 1 close-out"),
+        "Phase 1 close-out audit must remain the final Phase 1 item; found {last_item}"
+    );
+}
+
+#[test]
+fn database_test_helpers_ignore_empty_test_database_url_and_match_compose_port() {
+    let compose = fs::read_to_string("docker-compose.yml").expect("compose file should exist");
+    assert!(
+        compose.contains("55433:5432"),
+        "test helper fallback assertions assume the local docker compose Postgres port"
+    );
+
+    for path in [
+        "tests/core_api.rs",
+        "tests/batch008_core.rs",
+        "tests/batch009_core.rs",
+    ] {
+        let source = fs::read_to_string(path).expect("test source should exist");
+        assert!(
+            source.contains("filter(|value| runtime_usable_database_url(value))"),
+            "{path} must treat TEST_DATABASE_URL='' and credential-less PostgreSQL URLs as absent so runtime placeholder reruns use fallback"
+        );
+        assert!(
+            source.contains("credential_segment.split_once(':')"),
+            "{path} must reject username-only TEST_DATABASE_URL values such as postgres://harri@localhost/trade_compliance because libpq derives the OS user without a password"
+        );
+        assert!(
+            source.contains("!username.is_empty() && !password.is_empty()"),
+            "{path} must require both username and password before trusting TEST_DATABASE_URL"
+        );
+        assert!(
+            source.contains("@127.0.0.1:55433/trade_compliance"),
+            "{path} fallback database URL must match docker-compose.yml port 55433"
+        );
+    }
 }
 
 #[test]

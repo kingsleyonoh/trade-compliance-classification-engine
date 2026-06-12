@@ -28,16 +28,17 @@ function collectTestEvidence(result: BatchResult): Array<{ phase: string; eviden
 }
 
 function isExternalMutationMarker(value: string): boolean {
-  const text = value.trim();
+  const text = value.trim().replace(/^[\"']|[\"']$/g, "");
   if (/^remote:[^:]+:.+\s\((deleted|removed|created|modified|updated)\)$/i.test(text)) return true;
-  if (/^(ssh|scp|sftp|rsync):/i.test(text) && /\b(deleted|removed|created|modified|updated)\b/i.test(text)) return true;
+  if (/^(ssh|scp|sftp|rsync|s3|gs|az|https?):/i.test(text) && /\b(deleted|removed|created|modified|updated|posted|patched)\b/i.test(text)) return true;
   return false;
 }
 
 function isRemoteMutationCommand(command: string): boolean {
   const normalized = command.replace(/\s+/g, " ").trim();
-  if (!/\b(?:ssh|scp|sftp|rsync|kubectl|aws|gcloud|az|doctl|flyctl|vercel|netlify)\b/i.test(normalized)) return false;
-  return /\b(?:rm|mv|cp|chmod|chown|mkdir|rmdir|touch|truncate|tee|sed\s+-i|perl\s+-pi|docker\s+compose\s+(?:up|down|restart)|systemctl\s+(?:restart|stop|start)|kubectl\s+(?:apply|delete|patch|scale|rollout)|aws\s+s3\s+(?:rm|mv|cp|sync))\b/i.test(normalized);
+  if (/\bcurl\b[\s\S]*\b-X\s+(?:POST|PUT|PATCH|DELETE)\b/i.test(normalized) || /\bgh\s+(?:secret\s+set|api\s+(?:--method|-X)\s*(?:POST|PUT|PATCH|DELETE))/i.test(normalized)) return true;
+  if (!/\b(?:ssh|scp|sftp|rsync|kubectl|aws|gcloud|az|doctl|flyctl|vercel|netlify|terraform|helm)\b/i.test(normalized)) return false;
+  return /\b(?:rm|mv|cp|chmod|chown|mkdir|rmdir|touch|truncate|tee|sed\s+-i|perl\s+-pi|docker\s+compose\s+(?:up|down|restart)|systemctl\s+(?:restart|stop|start)|kubectl\s+(?:apply|delete|patch|scale|rollout)|aws\s+s3\s+(?:rm|mv|cp|sync)|terraform\s+apply|helm\s+upgrade|scp\s+\S+\s+\S+:|rsync\s+\S+\s+\S+:)\b/i.test(normalized);
 }
 
 function mentionsRemoteMutation(evidence: string): boolean {

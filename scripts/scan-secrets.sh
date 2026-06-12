@@ -102,8 +102,10 @@ declare -a SECRET_PATTERNS=(
 # Allow-list: any line matching one of these is treated as a placeholder.
 ALLOW_RE='\$\{[A-Z_][A-Z0-9_]*\}|\$\{\{[^}]+\}\}|\{\{[A-Z_][A-Z0-9_]*\}\}|<REDACTED>|[Yy][Oo][Uu][Rr][-_]?([Aa][Pp][Ii][-_]?)?([Kk][Ee][Yy]|[Tt][Oo][Kk][Ee][Nn]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Cc][Rr][Ee][Dd][Ee][Nn][Tt][Ii][Aa][Ll])[-_]?[Hh][Ee][Rr][Ee]|[Ee][Xx][Aa][Mm][Pp][Ll][Ee][_-]?([Aa][Pp][Ii][_-]?)?([Kk][Ee][Yy]|[Tt][Oo][Kk][Ee][Nn]|[Ss][Ee][Cc][Rr][Ee][Tt])|[Xx][Xx][Xx][_-]?([Tt][Ee][Ss][Tt]|[Ll][Ii][Vv][Ee]|[Pp][Rr][Oo][Dd]|[Dd][Ee][Vv])?[_-]?[Xx][Xx][Xx]|os\.environ|process\.env|getenv\(|config\.get\(|<your[^>]+>|<api[^>]+>|<token[^>]+>|<secret[^>]+>|[Rr][Ee][Dd][Aa][Cc][Tt][Ee][Dd]|[Pp][Ll][Aa][Cc][Ee][Hh][Oo][Ll][Dd][Ee][Rr]|[Ff][Aa][Kk][Ee][_-]?([Kk][Ee][Yy]|[Tt][Oo][Kk][Ee][Nn]|[Ss][Ee][Cc][Rr][Ee][Tt])|[Dd][Uu][Mm][Mm][Yy][_-]?([Kk][Ee][Yy]|[Tt][Oo][Kk][Ee][Nn]|[Ss][Ee][Cc][Rr][Ee][Tt])|[Ss][Aa][Mm][Pp][Ll][Ee][_-]?([Kk][Ee][Yy]|[Tt][Oo][Kk][Ee][Nn]|[Ss][Ee][Cc][Rr][Ee][Tt])|sk-XXXX|sk_test_xxxxx|\.{3,}'
 
+COMBINED_SECRET_RE=$(IFS='|'; printf '%s' "${SECRET_PATTERNS[*]}")
+
 # Skip these files entirely.
-SKIP_RE='\.lock$|package-lock\.json$|pnpm-lock\.yaml$|yarn\.lock$|composer\.lock$|Cargo\.lock$|Gemfile\.lock$|poetry\.lock$|uv\.lock$|\.min\.(js|css)$|\.bundle\.(js|css)$|\.(png|jpg|jpeg|gif|webp|svg|ico|woff|woff2|ttf|otf|eot|pdf|zip|tar|gz|tgz|bz2|7z|exe|dll|so|dylib|class|jar|pyc|pyo|whl|mp3|mp4|mov|avi)$|/node_modules/|/dist/|/build/|/\.next/|/\.venv/|/venv/|/__pycache__/|/target/|/vendor/|CHANGELOG\.md$|scan-secrets\.(ps1|sh)$|CODING_STANDARDS\.md$|yolo-honesty-checks\.md$'
+SKIP_RE='\.lock$|package-lock\.json$|pnpm-lock\.yaml$|yarn\.lock$|composer\.lock$|Cargo\.lock$|Gemfile\.lock$|poetry\.lock$|uv\.lock$|\.min\.(js|css)$|\.bundle\.(js|css)$|\.(png|jpg|jpeg|gif|webp|svg|ico|woff|woff2|ttf|otf|eot|pdf|zip|tar|gz|tgz|bz2|7z|exe|dll|so|dylib|class|jar|pyc|pyo|whl|mp3|mp4|mov|avi|stackdump)$|(^|/)\.pi/|(^|/)\.yolo/(events|knowledge-packs|logs|runtime|subagent-events|worktrees)/|/node_modules/|/dist/|/build/|/\.next/|/\.venv/|/venv/|/__pycache__/|/target/|/vendor/|CHANGELOG\.md$|scan-secrets\.(ps1|sh)$|CODING_STANDARDS\.md$|yolo-honesty-checks\.md$'
 
 # ---------- File enumeration ----------
 collect_files() {
@@ -132,6 +134,10 @@ while IFS= read -r FILE; do
     [[ ! -f "$FILE" ]] && continue
     [[ "$FILE" =~ $SKIP_RE ]] && continue
     SCANNED=$((SCANNED + 1))
+
+    if ! grep -E -q "$COMBINED_SECRET_RE" "$FILE" 2>/dev/null; then
+        continue
+    fi
 
     FILE_LINE_NO=0
     while IFS= read -r LINE || [[ -n "$LINE" ]]; do

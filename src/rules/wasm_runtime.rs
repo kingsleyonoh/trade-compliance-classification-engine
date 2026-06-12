@@ -43,6 +43,17 @@ impl RuleRuntime {
         rule_pack: &Value,
         product: &Value,
     ) -> Result<RuntimeClassification, RuleRuntimeError> {
+        self.check_runtime_limits(rule_pack)?;
+        let haystack = product.to_string().to_ascii_lowercase();
+        let rules = rule_pack
+            .get("rules")
+            .and_then(Value::as_array)
+            .ok_or(RuleRuntimeError::InvalidRulePack)?;
+        let evaluation = RuleEvaluation::from_rules(rules, &haystack)?;
+        evaluation.finish()
+    }
+
+    fn check_runtime_limits(&self, rule_pack: &Value) -> Result<(), RuleRuntimeError> {
         match rule_pack.get("simulate").and_then(Value::as_str) {
             Some("fuel_exhausted") => return Err(RuleRuntimeError::FuelExhausted),
             Some("timeout") => return Err(RuleRuntimeError::Timeout),
@@ -54,86 +65,105 @@ impl RuleRuntime {
         if self.timeout.is_zero() {
             return Err(RuleRuntimeError::Timeout);
         }
-
-        let haystack = product.to_string().to_ascii_lowercase();
-        let rules = rule_pack
-            .get("rules")
-            .and_then(Value::as_array)
-            .ok_or(RuleRuntimeError::InvalidRulePack)?;
-        let mut matched = Vec::new();
-        let mut rejected = Vec::new();
-        for rule in rules {
-            let contains = rule
-                .get("contains")
-                .and_then(Value::as_str)
-                .ok_or(RuleRuntimeError::InvalidRulePack)?
-                .to_ascii_lowercase();
-            if haystack.contains(&contains) {
-                matched.push(rule.clone());
-            } else {
-                rejected.push(json!({
-                    "code": rule.get("code").cloned().unwrap_or(Value::Null),
-                    "rule_id": rule.get("id").cloned().unwrap_or(Value::Null),
-                    "reason": "contains_not_matched"
-                }));
-            }
-        }
-        matched.sort_by(|left, right| {
-            let left_confidence = left
-                .get("confidence")
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0);
-            let right_confidence = right
-                .get("confidence")
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0);
-            right_confidence.total_cmp(&left_confidence)
-        });
-        if let Some(selected) = matched.first() {
-            let selected_confidence = selected
-                .get("confidence")
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0);
-            for rule in matched.iter().skip(1) {
-                let rule_confidence = rule
-                    .get("confidence")
-                    .and_then(Value::as_f64)
-                    .unwrap_or(0.0);
-                let reason = if selected_confidence - rule_confidence <= TIE_CONFIDENCE_DELTA {
-                    "tie_score"
-                } else {
-                    "lower_score"
-                };
-                rejected.push(json!({
-                    "code": rule.get("code").cloned().unwrap_or(Value::Null),
-                    "rule_id": rule.get("id").cloned().unwrap_or(Value::Null),
-                    "reason": reason
-                }));
-            }
-            return Ok(RuntimeClassification {
-                selected_code: selected
-                    .get("code")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                confidence: selected
-                    .get("confidence")
-                    .and_then(Value::as_f64)
-                    .unwrap_or(0.0),
-                risk_band: selected
-                    .get("risk_band")
-                    .and_then(Value::as_str)
-                    .unwrap_or("medium")
-                    .to_owned(),
-                matched_rules: vec![selected.clone()],
-                rejected_candidates: rejected,
-            });
-        }
-        Ok(RuntimeClassification {
-            selected_code: None,
-            confidence: 0.0,
-            risk_band: "high".to_string(),
-            matched_rules: Vec::new(),
-            rejected_candidates: rejected,
-        })
+        Ok(())
     }
+}
+
+struct RuleEvaluation {
+    matched: Vec<Value>,
+    rejected: Vec<Value>,
+}
+
+impl RuleEvaluation {
+    fn from_rules(rules: &[Value], haystack: &str) -> Result<Self, RuleRuntimeError> {
+        let mut evaluation = Self {
+            matched: Vec::new(),
+            rejected: Vec::new(),
+        };
+        for rule in rules {
+            evaluation.push_rule(rule, haystack)?;
+        }
+        evaluation.matched.sort_by(compare_rule_confidence);
+        Ok(evaluation)
+    }
+
+    fn push_rule(&mut self, rule: &Value, haystack: &str) -> Result<(), RuleRuntimeError> {
+        let contains = rule
+            .get("contains")
+            .and_then(Value::as_str)
+            .ok_or(RuleRuntimeError::InvalidRulePack)?
+            .to_ascii_lowercase();
+        if haystack.contains(&contains) {
+            self.matched.push(rule.clone());
+        } else {
+            self.rejected
+                .push(rejected_candidate(rule, "contains_not_matched"));
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<RuntimeClassification, RuleRuntimeError> {
+        let Some(selected) = self.matched.first().cloned() else {
+            return Ok(no_match_classification(self.rejected));
+        };
+        self.reject_lower_ranked_matches(&selected);
+        Ok(selected_classification(selected, self.rejected))
+    }
+
+    fn reject_lower_ranked_matches(&mut self, selected: &Value) {
+        let selected_confidence = rule_confidence(selected);
+        for rule in self.matched.iter().skip(1) {
+            let reason = if selected_confidence - rule_confidence(rule) <= TIE_CONFIDENCE_DELTA {
+                "tie_score"
+            } else {
+                "lower_score"
+            };
+            self.rejected.push(rejected_candidate(rule, reason));
+        }
+    }
+}
+
+fn compare_rule_confidence(left: &Value, right: &Value) -> std::cmp::Ordering {
+    rule_confidence(right).total_cmp(&rule_confidence(left))
+}
+
+fn rule_confidence(rule: &Value) -> f64 {
+    rule.get("confidence")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0)
+}
+
+fn selected_classification(selected: Value, rejected: Vec<Value>) -> RuntimeClassification {
+    RuntimeClassification {
+        selected_code: selected
+            .get("code")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        confidence: rule_confidence(&selected),
+        risk_band: selected
+            .get("risk_band")
+            .and_then(Value::as_str)
+            .unwrap_or("medium")
+            .to_owned(),
+        matched_rules: vec![selected],
+        rejected_candidates: rejected,
+    }
+}
+
+fn no_match_classification(rejected: Vec<Value>) -> RuntimeClassification {
+    RuntimeClassification {
+        selected_code: None,
+        confidence: 0.0,
+        risk_band: "high".to_string(),
+        matched_rules: Vec::new(),
+        rejected_candidates: rejected,
+    }
+}
+
+fn rejected_candidate(rule: &Value, reason: &'static str) -> Value {
+    json!({
+        "code": rule.get("code").cloned().unwrap_or(Value::Null),
+        "rule_id": rule.get("id").cloned().unwrap_or(Value::Null),
+        "reason": reason
+    })
 }

@@ -1,5 +1,7 @@
 use std::sync::{Arc, Mutex};
 
+pub use super::error::ProductSearchError;
+
 use serde::{Deserialize, Serialize};
 use tantivy::{
     collector::TopDocs,
@@ -156,6 +158,23 @@ impl ProductSearchIndex {
         if query.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
+        let combined = self.combined_query(tenant_id, query)?;
+        let searcher = self.inner.reader.searcher();
+        let top_docs = searcher.search(&combined, &TopDocs::with_limit(limit))?;
+        top_docs
+            .into_iter()
+            .map(|(_, address)| {
+                let doc = searcher.doc::<TantivyDocument>(address)?;
+                self.document_from_tantivy(doc)
+            })
+            .collect()
+    }
+
+    fn combined_query(
+        &self,
+        tenant_id: Uuid,
+        query: &str,
+    ) -> Result<Box<dyn Query>, ProductSearchError> {
         let fields = self.inner.fields;
         let parser = QueryParser::for_index(
             &self.inner.index,
@@ -175,19 +194,10 @@ impl ProductSearchIndex {
             Term::from_field_text(fields.tenant_id, &tenant_id.to_string()),
             tantivy::schema::IndexRecordOption::Basic,
         );
-        let combined: Box<dyn Query> = Box::new(BooleanQuery::intersection(vec![
+        Ok(Box::new(BooleanQuery::intersection(vec![
             Box::new(tenant_query),
             text_query,
-        ]));
-        let searcher = self.inner.reader.searcher();
-        let top_docs = searcher.search(&combined, &TopDocs::with_limit(limit))?;
-        top_docs
-            .into_iter()
-            .map(|(_, address)| {
-                let doc = searcher.doc::<TantivyDocument>(address)?;
-                self.document_from_tantivy(doc)
-            })
-            .collect()
+        ])))
     }
 
     fn document_from_tantivy(
@@ -230,18 +240,4 @@ impl Default for ProductSearchIndex {
     fn default() -> Self {
         Self::in_memory().expect("in-memory Tantivy product search index should initialize")
     }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum ProductSearchError {
-    #[error("product search index is unavailable")]
-    IndexUnavailable,
-    #[error("product search index operation failed: {0}")]
-    Tantivy(#[from] tantivy::TantivyError),
-    #[error("product search document is malformed: {0}")]
-    Json(#[from] serde_json::Error),
-    #[error("product search document contains an invalid UUID: {0}")]
-    Uuid(#[from] uuid::Error),
-    #[error("product search document is missing a stored field")]
-    StoredDocumentMissingField,
 }

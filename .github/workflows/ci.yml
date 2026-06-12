@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  test-and-image:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: trade_compliance
+          POSTGRES_PASSWORD: trade_compliance
+          POSTGRES_DB: trade_compliance
+        ports:
+          - 55433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      POSTGRES_USER: trade_compliance
+      POSTGRES_PASSWORD: trade_compliance
+      DATABASE_URL: postgres://${{ env.POSTGRES_USER }}:${{ env.POSTGRES_PASSWORD }}@localhost:55433/trade_compliance
+      JWT_SECRET: your-jwt-secret
+      API_KEY_PEPPER: your-api-key-pepper
+      SQLX_OFFLINE: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo fmt --all -- --check
+      - run: cargo test -- --test-threads=1
+      - run: bash scripts/scan-secrets.sh --mode all
+      - name: Build image
+        run: docker build -t ghcr.io/${{ github.repository }}:${{ github.sha }} .
+      - name: Push image
+        if: github.ref == 'refs/heads/main'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push ghcr.io/${{ github.repository }}:${{ github.sha }}

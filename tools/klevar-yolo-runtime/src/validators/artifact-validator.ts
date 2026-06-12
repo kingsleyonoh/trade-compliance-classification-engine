@@ -9,6 +9,10 @@ export async function validateArtifacts(cwd: string, result: BatchResult): Promi
   const flags = [];
   const hashes = new Map<string, string>();
   for (const rel of artifactPaths) {
+    if (!isSafeRelativeArtifactPath(rel)) {
+      flags.push(`ARTIFACT_UNSAFE_PATH:${rel}`);
+      continue;
+    }
     const file = path.join(cwd, rel);
     if (!(await exists(file))) {
       flags.push(`ARTIFACT_MISSING:${rel}`);
@@ -25,5 +29,11 @@ export async function validateArtifacts(cwd: string, result: BatchResult): Promi
 function artifactPath(artifact: unknown): string | null {
   const value = typeof artifact === "string" ? artifact : artifact && typeof artifact === "object" ? (artifact as Record<string, unknown>).path ?? (artifact as Record<string, unknown>).file : null;
   if (typeof value !== "string") return null;
-  return /^(?:unknown|n\/?a|not applicable|none|manual|tbd|todo|-)$/i.test(value.trim()) ? null : value;
+  const trimmed = value.trim().replace(/^['"]|['"]$/g, "");
+  return /^(?:unknown|n\/?a|not applicable|none|manual|tbd|todo|-)?$/i.test(trimmed) ? null : trimmed;
+}
+
+function isSafeRelativeArtifactPath(value: string): boolean {
+  const normalized = value.replace(/\\/g, "/");
+  return Boolean(normalized) && !normalized.includes("\0") && !path.isAbsolute(value) && !path.posix.isAbsolute(normalized) && !path.win32.isAbsolute(value) && !/^[A-Za-z]:[\\/]/.test(value) && !/^\\\\/.test(value) && !normalized.split("/").includes("..");
 }

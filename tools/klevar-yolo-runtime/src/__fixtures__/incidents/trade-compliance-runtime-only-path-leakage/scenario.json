@@ -1,0 +1,32 @@
+{
+  "kind": "runtime-classification",
+  "batch": 22,
+  "implementation": {
+    "schemaVersion": 1,
+    "agent": "implement",
+    "batch": 22,
+    "status": "FAILURE",
+    "itemsCompleted": [],
+    "filesChanged": [".yolo/runtime-state.json", "src/compliance/export.ts"],
+    "tests": {},
+    "failureType": "RUNTIME_GATES_REJECTED",
+    "flags": ["RUNTIME_ONLY_PATH_LEAKAGE:.yolo/runtime-state.json", "BUSINESS_LOGIC_RULE_MISSING:export-screening"],
+    "commit": null
+  },
+  "recovery": {
+    "schemaVersion": 1,
+    "agent": "bugfix",
+    "batch": 22,
+    "status": "SUCCESS",
+    "itemsCompleted": [],
+    "filesChanged": [".yolo/batch-results/batch-022-bugfix.json"],
+    "tests": { "regression": { "command": "npm test -- --path-policy", "exitCode": 0, "evidence": "runtime-only path filtered" } },
+    "flags": ["FIXED:RUNTIME_ONLY_PATH_LEAKAGE:.yolo/runtime-state.json"],
+    "commit": null
+  },
+  "expectedClassification": "mixed",
+  "expectedActiveBlockers": ["BUSINESS_LOGIC_RULE_MISSING:export-screening"],
+  "expectedQuarantinedStaleFindings": ["RUNTIME_GATES_REJECTED", "RUNTIME_ONLY_PATH_LEAKAGE:.yolo/runtime-state.json"],
+  "expectedRecommendationIncludes": "product blockers remain active",
+  "expectBugfixDispatch": false
+}

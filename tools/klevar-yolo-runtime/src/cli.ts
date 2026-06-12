@@ -1,10 +1,4 @@
 #!/usr/bin/env node
-import { loadConfig } from "./config.js";
-import { cleanBatch, rollbackLast, undoLast } from "./recovery.js";
-import { replayRun } from "./replay.js";
-import { runYolo } from "./runtime.js";
-import { failRuntimeFromError } from "./telemetry.js";
-import { pruneSuccessfulWorktrees } from "./worktree-retention.js";
 import type { YoloScope } from "./types.js";
 
 async function main(): Promise<void> {
@@ -13,29 +7,48 @@ async function main(): Promise<void> {
     console.log(helpText());
     return;
   }
+  if (args[0] === "acceptance-gate" || args[0] === "release-gate") {
+    const { formatReleaseGateResult, runReleaseGate } = await import("./release-gate.js");
+    const result = await runReleaseGate({ skipSandbox: args.includes("--skip-sandbox"), skipBuild: args.includes("--skip-build") });
+    console.log(formatReleaseGateResult(result));
+    if (!result.passed) process.exitCode = 2;
+    return;
+  }
   if (args[0] === "replay" && args[1]) {
+    const [{ loadConfig }, { replayRun }] = await Promise.all([import("./config.js"), import("./replay.js")]);
     const config = await loadConfig(process.cwd());
     await replayRun(process.cwd(), args[1], config.models.implement);
     return;
   }
+  if (args[0] === "incident-replay" && args[1]) {
+    const { formatIncidentReplayResult, replayIncidentFixture } = await import("./incident-replay.js");
+    const result = await replayIncidentFixture(args[1]);
+    console.log(formatIncidentReplayResult(result));
+    if (!result.passed) process.exitCode = 2;
+    return;
+  }
   if (args[0] === "clean" && args[1]) {
+    const { cleanBatch } = await import("./recovery.js");
     const result = await cleanBatch(process.cwd(), args[1], { logs: args.includes("--logs") });
     console.log(formatRecoveryResult(result));
     return;
   }
   if (args[0] === "rollback") {
+    const { rollbackLast } = await import("./recovery.js");
     const result = await rollbackLast(process.cwd(), { yes: args.includes("--yes"), push: args.includes("--push"), revert: args.includes("--revert") });
     console.log(formatRecoveryResult(result));
     if (!result.ok) process.exitCode = 2;
     return;
   }
   if (args[0] === "undo-last") {
+    const { undoLast } = await import("./recovery.js");
     const result = await undoLast(process.cwd(), { yes: args.includes("--yes"), push: args.includes("--push"), revert: args.includes("--revert") });
     console.log(formatRecoveryResult(result));
     if (!result.ok) process.exitCode = 2;
     return;
   }
   if (args[0] === "prune") {
+    const [{ loadConfig }, { pruneSuccessfulWorktrees }] = await Promise.all([import("./config.js"), import("./worktree-retention.js")]);
     const config = await loadConfig(process.cwd());
     const result = await pruneSuccessfulWorktrees(process.cwd(), { ...config.retention, allSuccess: args.includes("--all-success") });
     console.log(["OK", `Pruned: ${result.pruned.join(", ") || "none"}`, `Kept: ${result.kept.join(", ") || "none"}`, `Skipped: ${result.skipped.join(", ") || "none"}`].join("\n"));
@@ -44,6 +57,7 @@ async function main(): Promise<void> {
   const dryRun = args[0] === "dry-run" || args.includes("--dry-run");
   const filtered = args.filter((arg) => arg !== "dry-run" && arg !== "--dry-run");
   const scope = parseScope(filtered);
+  const { runYolo } = await import("./runtime.js");
   await runYolo(process.cwd(), scope, dryRun);
 }
 
@@ -58,6 +72,8 @@ function helpText(): string {
     "  cli.js full",
     "  cli.js continue",
     "  cli.js replay batch-001-implement",
+    "  cli.js incident-replay .yolo/incidents/example",
+    "  cli.js acceptance-gate [--skip-sandbox] [--skip-build]",
     "  cli.js clean batch-002 [--logs]",
     "  cli.js rollback [--yes] [--push] [--revert]",
     "  cli.js undo-last [--yes] [--push] [--revert]",
@@ -83,6 +99,7 @@ main().catch(async (error) => {
   const message = error instanceof Error ? error.stack ?? error.message : String(error);
   console.error(message);
   if (!(error instanceof Error && error.message.startsWith("Unknown scope:"))) {
+    const { failRuntimeFromError } = await import("./telemetry.js");
     await failRuntimeFromError(process.cwd(), error).catch(() => undefined);
   }
   process.exitCode = error instanceof Error && error.message.startsWith("Unknown scope:") ? 2 : 1;

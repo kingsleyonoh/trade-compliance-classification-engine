@@ -1,0 +1,31 @@
+{
+  "kind": "runtime-classification",
+  "batch": 56,
+  "implementation": {
+    "schemaVersion": 1,
+    "agent": "implement",
+    "batch": 56,
+    "status": "FAILURE",
+    "itemsCompleted": [],
+    "filesChanged": ["docs/progress.md", ".yolo/runtime/batches/batch-056/state.json"],
+    "tests": {},
+    "failureType": "RUNTIME_GATES_REJECTED",
+    "flags": ["TEMPLATE_MANAGED_PROTECTED_PATH:.agent/rules/CODEBASE_CONTEXT.md", "CHANGED_FILE_MISSING_METADATA:.yolo/runtime/batches/batch-056/state.json"]
+  },
+  "recovery": {
+    "schemaVersion": 1,
+    "agent": "bugfix",
+    "batch": 56,
+    "status": "SUCCESS",
+    "itemsCompleted": [],
+    "filesChanged": [".yolo/batch-results/batch-056-bugfix.json"],
+    "tests": { "regression": { "command": "npm test -- --runtime-state", "exitCode": 0, "evidence": "runtime metadata regenerated" } },
+    "flags": ["FIXED:RUNTIME_GATES_REJECTED"],
+    "commit": null
+  },
+  "expectedClassification": "runtime-owned",
+  "expectedActiveBlockers": [],
+  "expectedQuarantinedStaleFindings": ["CHANGED_FILE_MISSING_METADATA:.yolo/runtime/batches/batch-056/state.json", "RUNTIME_GATES_REJECTED"],
+  "expectedRecommendationIncludes": "do not dispatch bugfix",
+  "expectBugfixDispatch": false
+}

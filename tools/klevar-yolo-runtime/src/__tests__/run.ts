@@ -1,10 +1,11 @@
 import { existsSync, readFileSync } from "node:fs";
-import { access, mkdtemp, rm, writeFile, mkdir, readFile } from "node:fs/promises";
+import { access, mkdtemp, rm, writeFile, mkdir, readFile, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import assert from "node:assert/strict";
 import { staleUnansweredToolReason } from "../agent-session.js";
 import { validatePaths } from "../validators/path-validator.js";
+import { classifyRuntimePath } from "../path-policy.js";
 import { validateArtifacts } from "../validators/artifact-validator.js";
 import { blockingOpenFindings, canonicalizeBatchResultForRuntime, classifyBatchRisk, findingSummary, importAgentResultToState, recordGateState } from "../runtime-batch-state.js";
 import { validationPolicyFor } from "../validation-policy.js";
@@ -22,18 +23,18 @@ import { validateTdd } from "../validators/tdd-validator.js";
 import { validateE2e } from "../validators/e2e-validator.js";
 import { normalizeBatchResult, readBatchResult, readCanonicalBatchResult, validateContract } from "../result-contracts.js";
 import { buildCommandInvocation, normalizeCommand, execCommand, findBash } from "../util/process.js";
-import { nextBatchNumber, removeWindowsReservedDeviceFiles } from "../util/git.js";
-import { failRuntimeFromError, markHeartbeat, resetRuntimeState, setCheckpoint, setPhase } from "../telemetry.js";
+import { gitStatus, nextBatchNumber, removeWindowsReservedDeviceFiles } from "../util/git.js";
+import { failRuntimeFromError, markAffectedTestPlan, markHeartbeat, markJournalDecision, markRiskObservation, markSelfHeal, resetRuntimeState, setCheckpoint, setPhase } from "../telemetry.js";
 import { validateJournalContract } from "../journal-contract.js";
-import { validateAll, gatesPassed } from "../validators/index.js";
-import { canonicalizeBatchResultManifests, classifyBatchType, completedBatchCommitExists, findLatestResumableBatch, journalSource, mergeRecoveredResult, mergeRecoveredResultFromDisk, validationFailureContradictedByRecoveredEvidence } from "../runtime.js";
+import { validateAll, validateAllWithState, gatesPassed } from "../validators/index.js";
+import { blockingRecoveryFlags, canonicalizeBatchResultManifests, classifyBatchType, completedBatchCommitExists, failureSignature, findLatestResumableBatch, hasNonRecoverableRuntimeBlocker, isRuntimeOwnedRecoverySignature, journalSource, mergeRecoveredResult, mergeRecoveredResultFromDisk, readLatestSuccessfulBugfixResult, recoveryAttemptsExhausted, runtimeOwnedFailureRequiresStop, runtimePoisonedRecoveryLoop, shouldCapturePoisonedBatchIncidentFixture, validationFailureContradictedByRecoveredEvidence } from "../runtime.js";
 import { buildBatchContext } from "../context-builder.js";
 import { adjudicationAccepted, adjudicationAllowed, adjudicationNeedsBugfix, normalizeAdjudication, readAdjudicationFile } from "../adjudication.js";
 import { classifyGateFindings } from "../gate-findings.js";
 import { clearSubagentOutput, fillLegacyPlaceholders } from "../subagent-runner.js";
 import { appendSubagentEvent, budgetFromInvocation, summarizeSubagentSession } from "../subagent-telemetry.js";
 import { defaultConfig, loadConfig } from "../config.js";
-import { syncLocalOnlyFilesToRoot, syncWorktreeChangesToRoot } from "../worktree-sync.js";
+import { syncLocalOnlyFilesToRoot, syncWorktreeChangesToRoot, validateWorktreeMergeReadiness } from "../worktree-sync.js";
 import { isTransientRemoveError, pruneSuccessfulWorktrees } from "../worktree-retention.js";
 import { runPolicyConsistencyTests } from "./policy-consistency.js";
 import { repairCommittedCloseoutGate, verifyPreviousBatchGates } from "../gates.js";
@@ -43,9 +44,18 @@ import { loadClaims, markRuntimeClaim, prepareRuntimeClaim, validateClaims } fro
 import { planParallelBatches } from "../collaboration/scheduler.js";
 import { formatRuntimeNotification, shouldNotifyRuntimeFinish, telegramEnabled } from "../notifications.js";
 import { readPendingInbox, reconcileInbox, routeInboxEntries } from "../inbox-router.js";
+import { replayIncidentFixture } from "../incident-replay.js";
+import { formatReleaseGateResult, runReleaseGate } from "../release-gate.js";
+import { capturePoisonedBatchIncidentFixture } from "../incident-fixtures.js";
+import { healUnreadableRuntimeState, isSelfHealingSafetyBlocker } from "../self-healing.js";
+import { deterministicJournalPaths, writeDeterministicJournal } from "../journal-fast-path.js";
+import { classifyObservedRisk } from "../speed-risk.js";
+import { fixedFindingPrefix, isBlockingFlag, isPositiveFlag } from "../flag-classification.js";
+import { planAffectedTests } from "../affected-tests.js";
 import { routeInboxWithAi } from "../inbox-ai-router.js";
 import { buildRelevantKnowledgePack, expandCandidateRequests } from "../knowledge-retriever.js";
 import { markPhaseSupportDue, nextSupportPlan, supportGateName } from "../support-scheduler.js";
+import { acquireRuntimeLock, releaseRuntimeLock } from "../runtime-lock.js";
 import type { BatchResult, RuntimeConfig } from "../types.js";
 
 const tests: Array<[string, () => Promise<void> | void]> = [];
@@ -65,6 +75,82 @@ test("path policy globs are escaped safely", () => {
     flags: ["BLOCKED_PATH:secret.pem", "BLOCKED_PATH:.env.local", "BLOCKED_PATH:node_modules/pkg/index.js"]
   });
   assert.equal(validatePaths(["src/main.ts"], config).passed, true);
+});
+
+test("path policy normalizes Windows paths blocks nested generated dirs and rejects unsafe runtime paths", () => {
+  const gate = validatePaths([
+    "node_modules\\pkg\\index.js",
+    "apps\\web\\node_modules\\pkg\\index.js",
+    ".agent\\rules\\CODING_STANDARDS.md",
+    "../outside.txt",
+    "src/../../.env",
+    "C:\\tmp\\file",
+    ".yolo/runtime-state.json",
+    ".yolo/events/batch-001.jsonl",
+    ".yolo/logs/runtime.log",
+    ".yolo/worktrees/batch-001/src/app.ts",
+    ".yolo/incidents/batch-017/logs/runtime.log",
+    ".GIT/config",
+    ".ENV.local",
+    ".YOLO/runtime.config.json",
+    ".yolo/pi-sessions/session.json"
+  ], defaultConfig);
+  assert.deepEqual(gate.flags, [
+    "BLOCKED_PATH:node_modules\\pkg\\index.js",
+    "BLOCKED_PATH:apps\\web\\node_modules\\pkg\\index.js",
+    "TEMPLATE_MANAGED_PROTECTED_PATH:.agent\\rules\\CODING_STANDARDS.md",
+    "UNSAFE_PATH:../outside.txt",
+    "UNSAFE_PATH:src/../../.env",
+    "UNSAFE_PATH:C:\\tmp\\file",
+    "RUNTIME_ONLY_PATH:.yolo/runtime-state.json",
+    "RUNTIME_ONLY_PATH:.yolo/events/batch-001.jsonl",
+    "RUNTIME_ONLY_PATH:.yolo/logs/runtime.log",
+    "RUNTIME_ONLY_PATH:.yolo/worktrees/batch-001/src/app.ts",
+    "RUNTIME_ONLY_PATH:.yolo/incidents/batch-017/logs/runtime.log",
+    "BLOCKED_PATH:.GIT/config",
+    "BLOCKED_PATH:.ENV.local",
+    "RUNTIME_ONLY_PATH:.YOLO/runtime.config.json",
+    "RUNTIME_ONLY_PATH:.yolo/pi-sessions/session.json"
+  ]);
+  assert.equal(validatePaths([".yolo/gates/e2e-batch-001.md", ".yolo/batch-results/batch-001-implement.json"], defaultConfig).passed, true);
+});
+
+test("path classifier v2 assigns owner sync and deliverable dispositions", () => {
+  assert.deepEqual(classifyRuntimePath("src/app.ts"), {
+    path: "src/app.ts",
+    safe: true,
+    owner: "product",
+    sync: "copy",
+    deliverable: true,
+    localOnlyAllowed: false,
+    reason: "product-deliverable"
+  });
+  assert.deepEqual(classifyRuntimePath(".yolo/runtime/batches/batch-001/state.json"), {
+    path: ".yolo/runtime/batches/batch-001/state.json",
+    safe: true,
+    owner: "runtime",
+    sync: "ignore",
+    deliverable: false,
+    localOnlyAllowed: false,
+    reason: "runtime-control-plane"
+  });
+  assert.deepEqual(classifyRuntimePath(".yolo/incidents/batch-017/logs/runtime.log"), {
+    path: ".yolo/incidents/batch-017/logs/runtime.log",
+    safe: true,
+    owner: "runtime",
+    sync: "ignore",
+    deliverable: false,
+    localOnlyAllowed: false,
+    reason: "runtime-control-plane"
+  });
+  assert.equal(classifyRuntimePath(".yolo/gates/e2e-batch-001.md").sync, "runtime-artifact");
+  assert.equal(classifyRuntimePath(".yolo/gates/e2e-batch-001.md").deliverable, true);
+  assert.equal(classifyRuntimePath("tools/klevar-yolo-runtime/src/runtime.ts").owner, "tooling");
+  assert.equal(classifyRuntimePath("tools/klevar-yolo-runtime/src/runtime.ts").sync, "copy");
+  assert.equal(classifyRuntimePath("apps/web/node_modules/pkg/index.js").owner, "generated");
+  assert.equal(classifyRuntimePath("apps/web/node_modules/pkg/index.js").localOnlyAllowed, true);
+  assert.equal(classifyRuntimePath("../outside.txt").safe, false);
+  assert.equal(classifyRuntimePath("../outside.txt").sync, "reject");
 });
 
 test("Windows local wrapper commands resolve native companions", async () => {
@@ -100,6 +186,15 @@ test("Windows command runner prefers Bash when available", async () => {
   await rm(dir, { recursive: true, force: true });
 });
 
+test("Windows command runner executes simple node commands without Bash shell state", async () => {
+  const dir = await tempDir();
+  const invocation = buildCommandInvocation(`node ${JSON.stringify("C:\\tmp\\cli.js")} --help`, dir, "win32");
+  assert.equal(invocation.file, "node");
+  assert.deepEqual(invocation.args, ["C:\\tmp\\cli.js", "--help"]);
+  assert.equal(invocation.shell, false);
+  await rm(dir, { recursive: true, force: true });
+});
+
 test("Windows command runner falls back to normalized cmd when Bash disabled", async () => {
   const dir = await tempDir();
   await writeFile(join(dir, "gradlew.bat"), "@echo off\r\n");
@@ -113,12 +208,12 @@ test("Windows command runner falls back to normalized cmd when Bash disabled", a
   await rm(dir, { recursive: true, force: true });
 });
 
-test("protected paths allow configured generated paths", () => {
+test("protected paths override broad generated path allowlists", () => {
   const config = configWithPatterns([], [".agent/", ".yolo/runtime.config.json"], [".yolo/", "docs/progress.md"]);
   assert.deepEqual(validatePaths([".agent/rules/CODEBASE_CONTEXT.md", ".yolo/runtime.config.json", "docs/progress.md"], config), {
     name: "paths",
     passed: false,
-    flags: ["PROTECTED_PATH:.agent/rules/CODEBASE_CONTEXT.md"]
+    flags: ["TEMPLATE_MANAGED_PROTECTED_PATH:.agent/rules/CODEBASE_CONTEXT.md", "RUNTIME_ONLY_PATH:.yolo/runtime.config.json"]
   });
 });
 
@@ -133,7 +228,25 @@ test("default path policy allows runtime-owned knowledge and env example updates
     ".agent/rules/CODEBASE_CONTEXT.md",
     ".env.local"
   ], defaultConfig);
-  assert.deepEqual(result, { name: "paths", passed: false, flags: ["PROTECTED_PATH:.agent/rules/CODEBASE_CONTEXT.md", "BLOCKED_PATH:.env.local"] });
+  assert.deepEqual(result, { name: "paths", passed: false, flags: ["TEMPLATE_MANAGED_PROTECTED_PATH:.agent/rules/CODEBASE_CONTEXT.md", "BLOCKED_PATH:.env.local"] });
+});
+
+test("path policy rejects support deliverables for protected coordination and control-plane paths", () => {
+  const result = validatePaths(["AGENTS.md", "CLAUDE.md", ".cursorrules", ".agent/workflows/implement-next.md", ".agent/agents/yolo/yolo-subagent-support.md", ".yolo/runtime-state.json", ".env.production", "keys/prod.pem"], defaultConfig);
+  assert.deepEqual(result, {
+    name: "paths",
+    passed: false,
+    flags: [
+      "TEMPLATE_MANAGED_PROTECTED_PATH:AGENTS.md",
+      "TEMPLATE_MANAGED_PROTECTED_PATH:CLAUDE.md",
+      "TEMPLATE_MANAGED_PROTECTED_PATH:.cursorrules",
+      "TEMPLATE_MANAGED_PROTECTED_PATH:.agent/workflows/implement-next.md",
+      "TEMPLATE_MANAGED_PROTECTED_PATH:.agent/agents/yolo/yolo-subagent-support.md",
+      "RUNTIME_ONLY_PATH:.yolo/runtime-state.json",
+      "BLOCKED_PATH:.env.production",
+      "BLOCKED_PATH:keys/prod.pem"
+    ]
+  });
 });
 
 test("path policy allows evidence-backed documented command fixes in CODEBASE_CONTEXT", () => {
@@ -194,6 +307,52 @@ test("local-only nested node_modules directories are allowed when gitignored", a
   await execCommand("git add .gitignore && git commit -m init", dir, 30_000);
   const result = journalResult({ journal_entry_written: true, gate_file_written: true });
   result.localOnlyFiles = ["web/node_modules"];
+  result.filesChanged = [];
+  assert.deepEqual(await validateLocalOnlyFiles(dir, result, defaultConfig), { name: "local-only", passed: true, flags: [] });
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("local-only changed comparison normalizes Windows slashes dot prefixes and trailing slashes", async () => {
+  const dir = await tempDir();
+  await execCommand("git init && git config user.email test@example.com && git config user.name Test", dir, 30_000);
+  await writeFile(join(dir, ".gitignore"), "apps/web/.next/\n");
+  await mkdir(join(dir, "apps/web/.next"), { recursive: true });
+  const result = implementResult({ filesChanged: [".\\apps\\web\\.next"], localOnlyFiles: ["apps/web/.next/"] });
+  const gate = await validateLocalOnlyFiles(dir, result, defaultConfig);
+  assert.ok(gate.flags.includes("LOCAL_ONLY_LISTED_AS_CHANGED:apps/web/.next/"));
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("local-only directory children cannot also be changed deliverables", async () => {
+  const dir = await tempDir();
+  await execCommand("git init && git config user.email test@example.com && git config user.name Test", dir, 30_000);
+  await writeFile(join(dir, ".gitignore"), "dist/\n");
+  await mkdir(join(dir, "dist"), { recursive: true });
+  await writeFile(join(dir, "dist/app.js"), "compiled\n");
+  const gate = await validateLocalOnlyFiles(dir, implementResult({ filesChanged: ["dist/app.js"], localOnlyFiles: ["dist/"] }), defaultConfig);
+  assert.ok(gate.flags.includes("LOCAL_ONLY_LISTED_AS_CHANGED:dist/"));
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("local-only allows files inside nested generated dependency dirs when gitignored", async () => {
+  const dir = await tempDir();
+  await execCommand("git init && git config user.email test@example.com && git config user.name Test", dir, 30_000);
+  await writeFile(join(dir, ".gitignore"), "node_modules/\n");
+  const result = implementResult({ filesChanged: [], localOnlyFiles: ["apps/web/node_modules/pkg/index.js"] });
+  const gate = await validateLocalOnlyFiles(dir, result, defaultConfig);
+  assert.deepEqual(gate, { name: "local-only", passed: true, flags: [] });
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("local-only nested framework build directories are allowed when gitignored", async () => {
+  const dir = await tempDir();
+  await execCommand("git init && git config user.email test@example.com && git config user.name Test", dir, 30_000);
+  await mkdir(join(dir, "apps/web/.next/cache"), { recursive: true });
+  await writeFile(join(dir, ".gitignore"), ".next/\n");
+  await writeFile(join(dir, "apps/web/.next/cache/build.json"), "{}\n");
+  await execCommand("git add .gitignore && git commit -m init", dir, 30_000);
+  const result = journalResult({ journal_entry_written: true, gate_file_written: true });
+  result.localOnlyFiles = ["apps/web/.next/"];
   result.filesChanged = [];
   assert.deepEqual(await validateLocalOnlyFiles(dir, result, defaultConfig), { name: "local-only", passed: true, flags: [] });
   await rm(dir, { recursive: true, force: true });
@@ -523,6 +682,21 @@ test("progress contract allows non-closeout audit verification items before phas
   await rm(dir, { recursive: true, force: true });
 });
 
+test("git status preserves leading status space for first modified path", async () => {
+  const dir = await tempDir();
+  await mkdir(join(dir, "apps/web"), { recursive: true });
+  await writeFile(join(dir, "apps/web/next-env.d.ts"), "initial");
+  await execCommand("git init && git config user.email test@example.com && git config user.name Test && git add . && git commit -m init", dir, 30_000);
+  await writeFile(join(dir, "apps/web/next-env.d.ts"), "changed");
+  const status = await gitStatus(dir);
+  assert.equal(status[0], " M apps/web/next-env.d.ts");
+  const root = await tempDir();
+  const synced = await syncWorktreeChangesToRoot(dir, root, ["apps/web/next-env.d.ts"]);
+  assert.deepEqual(synced, ["apps/web/next-env.d.ts"]);
+  await rm(root, { recursive: true, force: true });
+  await rm(dir, { recursive: true, force: true });
+});
+
 test("git commit cleanup removes Windows reserved device files before staging", async () => {
   const dir = await tempDir();
   await writeFile(join(dir, "NUL"), "accidental device file\n");
@@ -577,13 +751,77 @@ test("journal source falls back to validate result for audit close-out batches",
   await writeFile(join(dir, ".yolo/batch-results/batch-029-validate.md"), "# Validate\n");
   assert.deepEqual(await journalSource(dir, { number: 29, type: "audit", items: [] }), { file: ".yolo/batch-results/batch-029-validate.md", type: "validate" });
   await writeFile(join(dir, ".yolo/batch-results/batch-029-bugfix-2.md"), "# Bugfix\n");
+  await writeFile(join(dir, ".yolo/batch-results/batch-029-bugfix-2.json"), JSON.stringify(implementResult({ agent: "bugfix" })));
   assert.deepEqual(await journalSource(dir, { number: 29, type: "audit", items: [] }), { file: ".yolo/batch-results/batch-029-bugfix-2.md", type: "bugfix" });
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("journal source ignores failed stale bugfix attempts and uses latest successful bugfix", async () => {
+  const dir = await tempDir();
+  await mkdir(join(dir, ".yolo/batch-results"), { recursive: true });
+  await writeFile(join(dir, ".yolo/batch-results/batch-007-bugfix.md"), "# Failed stale bugfix\n");
+  await writeFile(join(dir, ".yolo/batch-results/batch-007-bugfix.json"), JSON.stringify(implementResult({ agent: "bugfix", status: "FAILURE", failureType: "AGENT_STALE_TOOL_TIMEOUT", flags: ["AGENT_STALE_TOOL_TIMEOUT"] })));
+  await writeFile(join(dir, ".yolo/batch-results/batch-007-bugfix-2.md"), "# Successful bugfix\n");
+  await writeFile(join(dir, ".yolo/batch-results/batch-007-bugfix-2.json"), JSON.stringify(implementResult({ agent: "bugfix", status: "SUCCESS" })));
+  assert.deepEqual(await journalSource(dir, { number: 7, type: "implement", items: [] }), { file: ".yolo/batch-results/batch-007-bugfix-2.md", type: "bugfix" });
   await rm(dir, { recursive: true, force: true });
 });
 
 test("journal prompt placeholders include runtime-selected source file and type", () => {
   const filled = fillLegacyPlaceholders("{{BATCH_RESULT_FILE}} {{BATCH_TYPE}} {{WORKSPACE_FILE}}", { id: "batch-029-journal", role: "journal", promptFile: "p.md", context: "", outputBase: ".yolo/batch-results/batch-029-journal", cwd: process.cwd(), route: {}, promptVars: { BATCH_RESULT_FILE: ".yolo/batch-results/batch-029-validate.md", BATCH_TYPE: "validate" } });
   assert.equal(filled, ".yolo/batch-results/batch-029-validate.md validate .yolo/batch-results/batch-029-journal.md");
+});
+
+test("deterministic journal fast path writes valid journal and gate artifacts", async () => {
+  const dir = await tempDir();
+  const batch = { number: 12, type: "implement", items: [progressItem("[UI]", "Leaf component polish — PRD §5b")] } as any;
+  const result = implementResult({ batch: 12, filesChanged: ["apps/web/components/card.tsx"], tests: { green: { command: "npm test -- card", exitCode: 0, evidence: "pass" } } });
+  const journal = await writeDeterministicJournal({ cwd: dir, batch, result, config: defaultConfig });
+  assert.ok(journal);
+  assert.deepEqual(validateJournalContract(journal!), { passed: true, flags: [] });
+  const paths = deterministicJournalPaths(12);
+  assert.match(await readFileText(join(dir, paths.journalPath)), /Deterministic journal fast path/);
+  assert.match(await readFileText(join(dir, paths.gatePath)), /result: PASS/);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("deterministic journal fast path declines audits and high-risk batches", async () => {
+  const dir = await tempDir();
+  const auditBatch = { number: 13, type: "audit", items: [progressItem("[AUDIT]", "Phase close-out — PRD §15")] } as any;
+  const highRiskBatch = { number: 14, type: "implement", items: [progressItem("[API]", "Auth migration — PRD §8")] } as any;
+  assert.equal(await writeDeterministicJournal({ cwd: dir, batch: auditBatch, result: implementResult({ batch: 13 }), config: defaultConfig }), null);
+  assert.equal(await writeDeterministicJournal({ cwd: dir, batch: highRiskBatch, result: implementResult({ batch: 14, filesChanged: ["src/auth.ts"] }), config: defaultConfig }), null);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("observe-only risk classification does not change validation policy", () => {
+  const batch = { number: 15, type: "implement", items: [progressItem("[API]", "Auth route — PRD §8")] } as any;
+  const result = implementResult({ filesChanged: ["src/auth.ts"] });
+  const before = validationPolicyFor(batch, result, defaultConfig);
+  const observed = classifyObservedRisk({ batch, result });
+  const after = validationPolicyFor(batch, result, defaultConfig);
+  assert.equal(observed.observedOnly, true);
+  assert.deepEqual(after, before);
+});
+
+test("affected-test planner is observe-only and rejects unsafe runtime paths", () => {
+  const result = implementResult({ filesChanged: ["src/service.ts", "tests/service.test.ts", ".yolo/runtime/batches/batch-001/state.json", "../outside.txt"] });
+  result.tests = { regression: { command: "npm test", exitCode: 0, evidence: "pass" } };
+  const batch = { number: 16, type: "implement", items: [{ ...progressItem("[API]", "Service — PRD §8"), affectedFiles: ["src/service.ts"] }] } as any;
+  const beforeTests = JSON.stringify(result.tests);
+  const plan = planAffectedTests({ batch, result });
+  assert.equal(plan.observedOnly, true);
+  assert.equal(plan.confidence, "medium");
+  assert.ok(plan.files.includes("src/service.ts"));
+  assert.ok(plan.candidateCommands.includes("npm test -- tests/service.test.ts"));
+  assert.ok(plan.rejected.some((entry) => entry.path === ".yolo/runtime/batches/batch-001/state.json"));
+  assert.ok(plan.rejected.some((entry) => entry.path === "../outside.txt"));
+  assert.equal(JSON.stringify(result.tests), beforeTests);
+});
+
+test("speed v2 does not alter batch selection source", async () => {
+  const progressSource = await readFileText(join(process.cwd(), "src/progress-parser.ts"));
+  assert.doesNotMatch(progressSource, /deterministicJournal|observeRisk|observeAffectedTests|planAffectedTests|classifyObservedRisk/);
 });
 
 test("journal contract rejects non-array flags instead of crashing runtime", () => {
@@ -746,7 +984,7 @@ test("wiring verifier infers descriptive API and npm script evidence", async () 
   await mkdir(join(dir, "scripts"), { recursive: true });
   await mkdir(join(dir, "src/routes/public"), { recursive: true });
   await mkdir(join(dir, "src"), { recursive: true });
-  await writeFile(join(dir, "scripts/run-e2e.ts"), "console.log('PASS POST /api/onboard invalid payload 400 without server-error log');\n");
+  await writeFile(join(dir, "scripts/run-e2e.ts"), "console.log('PASS POST /api/onboard invalid payload 400 without server-error log');\nconsole.log('PASS Fastify onClose closes rate-limit Redis singleton');\n");
   await writeFile(join(dir, "src/routes/public/onboard.ts"), "router.post('/api/onboard', async () => {});\n");
   await writeFile(join(dir, "src/server.ts"), "app.addHook('onClose', async () => closeRateLimitRedis());\n");
   const result = implementResult({ filesChanged: ["src/routes/public/onboard.ts", "src/server.ts", "scripts/run-e2e.ts"] });
@@ -807,6 +1045,47 @@ test("wiring verifier infers module function symbols from compact entrypoints", 
   };
   const gate = await validateWiring(dir, { number: 13, type: "implement", items: [progressItem("[API]", "Repository functions — PRD §7")] } as any, result, true);
   assert.deepEqual(gate, { name: "wiring", passed: true, flags: [] });
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("wiring verifier infers Scala package class method entrypoints from focused tests", async () => {
+  const dir = await tempDir();
+  await mkdir(join(dir, "src/test/scala/solver"), { recursive: true });
+  await writeFile(join(dir, "src/test/scala/solver/OrToolsSolverAdapterSpec.scala"), [
+    "package solver",
+    "class OrToolsSolverAdapterSpec extends munit.FunSuite {",
+    "  test(\"solve returns a feasible assignment\") {",
+    "    val adapter = new OrToolsSolverAdapter()",
+    "    assert(adapter.solve(SolverInput.empty).isRight)",
+    "  }",
+    "}"
+  ].join("\n"));
+  const result = implementResult({ filesChanged: ["src/main/scala/solver/OrToolsSolverAdapter.scala"] });
+  result.wiring = {
+    required: true,
+    entrypoints: [{ type: "module", path: "solver.OrToolsSolverAdapter.solve", verifiedBy: "SolverAdapterSpec" }]
+  };
+  const gate = await validateWiring(dir, { number: 15, type: "implement", items: [progressItem("[INTEGRATION]", "Solver adapter — PRD §5.4")] } as any, result, true);
+  assert.deepEqual(gate, { name: "wiring", passed: true, flags: [] });
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("wiring verifier keeps prose-only diagnostics when Scala entrypoint proof is missing", async () => {
+  const dir = await tempDir();
+  await mkdir(join(dir, "src/test/scala/solver"), { recursive: true });
+  await writeFile(join(dir, "src/test/scala/solver/OrToolsSolverAdapterSpec.scala"), [
+    "package solver",
+    "class OrToolsSolverAdapterSpec extends munit.FunSuite {",
+    "  test(\"constructs adapter\") { assert(new OrToolsSolverAdapter() != null) }",
+    "}"
+  ].join("\n"));
+  const result = implementResult({ filesChanged: ["src/main/scala/solver/OrToolsSolverAdapter.scala"] });
+  result.wiring = {
+    required: true,
+    entrypoints: [{ type: "module", path: "solver.OrToolsSolverAdapter.solve", verifiedBy: "SolverAdapterSpec" }]
+  };
+  const gate = await validateWiring(dir, { number: 16, type: "implement", items: [progressItem("[INTEGRATION]", "Solver adapter — PRD §5.4")] } as any, result, true);
+  assert.deepEqual(gate, { name: "wiring", passed: false, flags: ["ENTRYPOINT_VERIFIER_PROSE_ONLY:solver.OrToolsSolverAdapter.solve"] });
   await rm(dir, { recursive: true, force: true });
 });
 
@@ -1241,6 +1520,18 @@ test("product quality validator skips backend ui package controllers", async () 
   await rm(dir, { recursive: true, force: true });
 });
 
+test("product quality validator does not treat missing-evidence flags as evidence", async () => {
+  const dir = await tempDir();
+  await mkdir(join(dir, "docs"), { recursive: true });
+  await writeFile(join(dir, "docs/demo_prd.md"), "# PRD\n## Frontend Product Quality Contract\nMOBILE_VIEWPORT_PASS required for mobile responsive UI.\n");
+  await writeFile(join(dir, "DESIGN.md"), "# Design\n## Visual System\nColor spacing typography.\n## Accessibility\nKeyboard focus contrast.\n## Responsive\nMobile touch.\n## States\nLoading empty error offline warning success.\n");
+  const result = implementResult({ filesChanged: ["src/App.tsx"], flags: ["MOBILE_VIEWPORT_EVIDENCE_MISSING"] });
+  const gate = await validateProductQuality(dir, { number: 1, type: "implement", items: [progressItem("[UI]", "UI — PRD §5b")] } as any, result, true);
+  assert.equal(gate.passed, false);
+  assert.ok(gate.flags.includes("MOBILE_VIEWPORT_EVIDENCE_MISSING"));
+  await rm(dir, { recursive: true, force: true });
+});
+
 test("product quality validator accepts canonical visual system heading", async () => {
   const dir = await tempDir();
   await mkdir(join(dir, "docs"), { recursive: true });
@@ -1314,8 +1605,99 @@ test("canonical finding lifecycle closes previously open gate findings", async (
   assert.equal(findingSummary(closed).fixed, 1);
   const dir = await tempDir();
   await importAgentResultToState(dir, batch, "validate", { ...implementResult({ status: "FAILURE", failureType: "UNIMPLEMENTED_ASSIGNED_ITEM", flags: ["UNIMPLEMENTED_ASSIGNED_ITEM"] }), agent: "validate" });
-  const success = await importAgentResultToState(dir, batch, "validate", { ...implementResult({ status: "SUCCESS", flags: [], tests: { green: { command: "npm test", exitCode: 0, evidence: "fixed" } } }), agent: "validate" });
+  const success = await importAgentResultToState(dir, batch, "validate", { ...implementResult({ status: "SUCCESS", flags: [], tests: { green: { command: "npm test", exitCode: 0, evidence: "generic pass only" } } }), agent: "validate" });
   assert.equal(blockingOpenFindings(success).length, 0);
+  assert.ok(success.closureTraces?.some((trace) => trace.findingId === "UNIMPLEMENTED_ASSIGNED_ITEM" && trace.cause === "validate-evidence"));
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("artifact-only bugfix fixed flags do not close canonical findings", async () => {
+  const batch = { number: 27, type: "implement", items: [progressItem("[API]", "Supplier operations — PRD §8b")] } as any;
+  const dir = await tempDir();
+  await importAgentResultToState(dir, batch, "validate", { ...implementResult({ status: "FAILURE", failureType: "BUSINESS_LOGIC_DRIFT", flags: ["BUSINESS_LOGIC_DRIFT"] }), agent: "validate" });
+  const state = await importAgentResultToState(dir, batch, "bugfix", { ...implementResult({ agent: "bugfix", flags: ["BUSINESS_LOGIC_DRIFT_FIXED"], filesChanged: [".yolo/gates/bugfix-batch-027-contract.mjs", ".yolo/batch-results/batch-027-bugfix.json"] }) });
+  assert.deepEqual(blockingOpenFindings(state).map((finding) => finding.id), ["BUSINESS_LOGIC_DRIFT"]);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("artifact-only recovery evidence closes matching canonical findings when commands pass", async () => {
+  const batch = { number: 45, type: "implement", items: [progressItem("[FIX]", "Runtime validation recovery — PRD §7")] } as any;
+  const dir = await tempDir();
+  await importAgentResultToState(dir, batch, "validate", { ...implementResult({ status: "FAILURE", flags: ["BUSINESS_LOGIC_DRIFT_APPEND_ONLY_NOTELOG_OVERWRITE", "BUSINESS_LOGIC_DRIFT_TENANT_FAIRNESS_DROPS_RATE_LIMITED_JOBS"] }), agent: "validate" });
+  const state = await importAgentResultToState(dir, batch, "bugfix", { ...implementResult({ agent: "bugfix", flags: ["BUSINESS_LOGIC_EVIDENCE_APPEND_ONLY_NOTELOG_PASS", "BUSINESS_LOGIC_EVIDENCE_TENANT_FAIRNESS_DELAYED_REQUEUE_PASS"], filesChanged: [".yolo/batch-results/batch-045-bugfix-3.json", ".yolo/gates/bugfix-batch-045.md"], tests: { green: { command: "npm run test:unit -- tests/setup/batch-045-runtime-contract.vitest.ts", exitCode: 0, evidence: "artifact recovery contract passed" } } }) });
+  assert.deepEqual(blockingOpenFindings(state), []);
+  assert.equal(findingSummary(state).fixed, 2);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("canonical reconciliation records closure trace for runtime-only command-backed bugfix evidence", async () => {
+  const batch = { number: 45, type: "implement", items: [progressItem("[FIX]", "Runtime validation recovery — PRD §7")] } as any;
+  const dir = await tempDir();
+  await importAgentResultToState(dir, batch, "validate", { ...implementResult({ status: "FAILURE", flags: ["BUSINESS_LOGIC_DRIFT_APPEND_ONLY_NOTELOG_OVERWRITE"] }), agent: "validate" });
+  const state = await importAgentResultToState(dir, batch, "bugfix", { ...implementResult({ agent: "bugfix", flags: ["BUSINESS_LOGIC_EVIDENCE_APPEND_ONLY_NOTELOG_PASS"], filesChanged: [".yolo/batch-results/batch-045-bugfix-2.json", ".yolo/gates/bugfix-batch-045.md"], tests: { green: { command: "npm run test:unit -- tests/setup/batch-045-runtime-contract.vitest.ts", exitCode: 0, evidence: "artifact recovery contract passed" } } }) });
+  assert.deepEqual(blockingOpenFindings(state), []);
+  assert.ok(state.closureTraces?.some((trace) => trace.findingId === "BUSINESS_LOGIC_DRIFT_APPEND_ONLY_NOTELOG_OVERWRITE" && trace.cause === "artifact-command-evidence"));
+  assert.deepEqual(state.openExplanations, []);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("canonical reconciliation explains runtime-only fixed flags without passing command evidence", async () => {
+  const batch = { number: 45, type: "implement", items: [progressItem("[FIX]", "Runtime validation recovery — PRD §7")] } as any;
+  const dir = await tempDir();
+  await importAgentResultToState(dir, batch, "validate", { ...implementResult({ status: "FAILURE", flags: ["BUSINESS_LOGIC_DRIFT_APPEND_ONLY_NOTELOG_OVERWRITE"] }), agent: "validate" });
+  const state = await importAgentResultToState(dir, batch, "bugfix", { ...implementResult({ agent: "bugfix", flags: ["BUSINESS_LOGIC_DRIFT_FIXED"], filesChanged: [".yolo/batch-results/batch-045-bugfix-2.json"], tests: { green: { command: "", exitCode: 0, evidence: "not runnable" } } }) });
+  assert.deepEqual(blockingOpenFindings(state).map((finding) => finding.id), ["BUSINESS_LOGIC_DRIFT_APPEND_ONLY_NOTELOG_OVERWRITE"]);
+  assert.ok(state.openExplanations?.some((item) => item.findingId === "BUSINESS_LOGIC_DRIFT_APPEND_ONLY_NOTELOG_OVERWRITE" && item.reason.includes("runtime-only result lacks passing command evidence")));
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("semantic bugfix fixed flags close matching canonical findings", async () => {
+  const batch = { number: 27, type: "implement", items: [progressItem("[API]", "Supplier operations — PRD §8b")] } as any;
+  const dir = await tempDir();
+  await importAgentResultToState(dir, batch, "validate", { ...implementResult({ status: "FAILURE", failureType: "BUSINESS_LOGIC_DRIFT", flags: ["BUSINESS_LOGIC_DRIFT"] }), agent: "validate" });
+  const state = await importAgentResultToState(dir, batch, "bugfix", { ...implementResult({ agent: "bugfix", flags: ["BUSINESS_LOGIC_DRIFT_FIXED"], filesChanged: ["apps/web/app/api/supplier-orders/route.ts", "tests/e2e/api/supplier-operations.spec.ts"] }) });
+  assert.deepEqual(blockingOpenFindings(state), []);
+  assert.equal(findingSummary(state).fixed, 1);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("semantic recovered flags close matching replay planner job and expected-totals findings", async () => {
+  const batch = { number: 16, type: "implement", items: [progressItem("[JOB]", "Replay and planner recovery — PRD §7")] } as any;
+  const dir = await tempDir();
+  await importAgentResultToState(dir, batch, "validate", { ...implementResult({ status: "FAILURE", flags: ["REPLAY_EXPECTED_TOTALS_EVIDENCE_GAP", "PLANNER_REPLAY_PARITY_GAP", "JOB_RUN_ONCE_ENTRYPOINT_UNVERIFIED"] }), agent: "validate" });
+  const state = await importAgentResultToState(dir, batch, "bugfix", { ...implementResult({ agent: "bugfix", flags: ["REPLAY_EXPECTED_TOTALS_EVIDENCE_GAP_RECOVERED", "PLANNER_REPLAY_PARITY_RECOVERED", "JOB_RUN_ONCE_ENTRYPOINT_VERIFIED"], filesChanged: ["src/jobs/replay_worker.nim", "tests/verify_batch_016_replay.sh"] }) });
+  assert.deepEqual(blockingOpenFindings(state), []);
+  assert.equal(findingSummary(state).fixed, 3);
+  assert.ok(state.closureTraces?.some((trace) => trace.findingId === "REPLAY_EXPECTED_TOTALS_EVIDENCE_GAP" && trace.cause === "bugfix-semantic-evidence"));
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("state hygiene quarantines stale runtime support findings after trusted Billbee B065-style recovery", async () => {
+  const batch = { number: 65, type: "support", items: [progressItem("[TOOLING]", "Runtime support recovery — PRD N/A")] } as any;
+  const dir = await tempDir();
+  await importAgentResultToState(dir, batch, "validate", { ...implementResult({ status: "FAILURE", flags: ["RUNTIME_GATES_REJECTED", "PROTECTED_PATH:.agent/rules/CODING_STANDARDS.md", "MODULARITY_RULE_FILE_LIMIT_VIOLATION"] }), agent: "validate" });
+  const state = await importAgentResultToState(dir, batch, "bugfix", { ...implementResult({ agent: "bugfix", flags: ["MODULARITY_RULE_FILE_WARNING_ROUTED_NON_BLOCKING", "PROTECTED_PATH_METADATA_REMOVED"], filesChanged: [".yolo/batch-results/batch-065-bugfix-2.json", ".yolo/gates/bugfix-batch-065.md"], tests: { green: { command: "npm test -- --runtime-hygiene", exitCode: 0, evidence: "trusted recovery contract passed" } } }) });
+  assert.deepEqual(blockingOpenFindings(state), []);
+  assert.ok(state.findings.some((finding) => finding.id === "RUNTIME_GATES_REJECTED" && finding.status === "stale"));
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("state hygiene preserves real product blockers while quarantining stale Commercial B016-style tooling findings", async () => {
+  const batch = { number: 16, type: "implement", items: [progressItem("[JOB]", "Replay and planner recovery — PRD §7")] } as any;
+  const dir = await tempDir();
+  await importAgentResultToState(dir, batch, "validate", { ...implementResult({ status: "FAILURE", flags: ["RUNTIME_GATES_REJECTED", "BUSINESS_LOGIC_DRIFT_EXPECTED_TOTALS"] }), agent: "validate" });
+  const state = await importAgentResultToState(dir, batch, "bugfix", { ...implementResult({ agent: "bugfix", flags: ["GENERATED_FILE_DRIFT_REVERTED"], filesChanged: [".yolo/batch-results/batch-016-bugfix.json", ".yolo/gates/bugfix-batch-016.md"], tests: { green: { command: "npm test -- --commercial-b016-runtime-contract", exitCode: 0, evidence: "runtime artifact recovery passed" } } }) });
+  assert.deepEqual(blockingOpenFindings(state).map((finding) => finding.id), ["BUSINESS_LOGIC_DRIFT_EXPECTED_TOTALS"]);
+  assert.ok(state.findings.some((finding) => finding.id === "RUNTIME_GATES_REJECTED" && finding.status === "stale"));
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("bugfix success does not close unrelated open findings without explicit fix evidence", async () => {
+  const batch = { number: 21, type: "implement", items: [progressItem("[DATA]", "Authority guardrail — PRD §5.2")] } as any;
+  const dir = await tempDir();
+  await importAgentResultToState(dir, batch, "validate", { ...implementResult({ status: "FAILURE", failureType: "BUSINESS_LOGIC_DRIFT", flags: ["BUSINESS_LOGIC_DRIFT", "CUSTOMER_NOTE_ALLOWLIST_GAP"] }), agent: "validate" });
+  const state = await importAgentResultToState(dir, batch, "bugfix", { ...implementResult({ status: "SUCCESS", flags: ["AUTH_BOUNDARY_GAP_FIXED", "REGRESSION_PASS"], tests: { green: { command: "npm test", exitCode: 0, evidence: "auth fixed" } } }), agent: "bugfix" });
+  assert.deepEqual(blockingOpenFindings(state).map((finding) => finding.id).sort(), ["BUSINESS_LOGIC_DRIFT", "CUSTOMER_NOTE_ALLOWLIST_GAP"]);
   await rm(dir, { recursive: true, force: true });
 });
 
@@ -1329,7 +1711,305 @@ test("validation policy classifies critical and low risk batches", () => {
   assert.equal(validationPolicyFor(critical, implementResult(), { ...defaultConfig, validationMode: "fast" }).requireAdversarialValidation, true);
 });
 
-test("runtime source uses canonical batch state and blocks open findings", async () => {
+test("canonical runtime state treats positive verified flags with explanatory missing text as non-blocking", async () => {
+  const dir = await tempDir();
+  const batch = { number: 32, type: "implement", items: [progressItem("[FIX]", "Phase support validation — PRD N/A")] } as any;
+  const result = implementResult({
+    flags: ["ALREADY_IMPLEMENTED_VERIFIED: Phase implementation surfaces were already present; objective gap was missing progress support item."]
+  });
+  const state = await importAgentResultToState(dir, batch, "implement", result);
+  assert.deepEqual(blockingOpenFindings(state), []);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("canonical runtime state ignores stale positive verified findings when deciding blockers", () => {
+  const state = {
+    schemaVersion: 1 as const,
+    batch: 32,
+    selectedItems: [],
+    changedFiles: [],
+    risk: { class: "low" as const, reasons: [] },
+    currentResult: implementResult(),
+    findings: [{ id: "ALREADY_IMPLEMENTED_VERIFIED: implementation present; missing progress proof was added", source: "bugfix", status: "open" as const, evidence: [], lastCheckedAt: new Date().toISOString() }],
+    commands: [],
+    gates: {},
+    updatedAt: new Date().toISOString()
+  };
+  assert.deepEqual(blockingOpenFindings(state), []);
+});
+
+test("canonical runtime state classifies flags by code before explanatory blocker prose", async () => {
+  const dir = await tempDir();
+  const batch = { number: 33, type: "implement", items: [progressItem("[FIX]", "Flag taxonomy — PRD N/A")] } as any;
+  const result = implementResult({
+    flags: [
+      "TENANT_NEUTRALITY_SWEEP_NO_LEAKS: no leakage or missing tenant secrets found",
+      "PRIVACY_MATRIX_NOT_APPLICABLE: privacy gap is missing by design for docs-only work",
+      "BUNDLE_DYNAMIC_IMPORT_AUDIT_EVIDENCE_RECORDED: missing bundle metric recorded as not applicable",
+      "FUTURE_PHASE_SUCCESS_CRITERIA_RECORDED_AS_MANUAL_NOT_FINDINGS",
+      "CROSS_ORDER_SUPPLIER_BUNDLING_REJECTED: invalid cross-order bundling correctly rejected"
+    ]
+  });
+  const state = await importAgentResultToState(dir, batch, "implement", result);
+  assert.deepEqual(blockingOpenFindings(state), []);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("canonical runtime state treats explicit non-blocking failed-attempt flags as warnings", async () => {
+  const dir = await tempDir();
+  const batch = { number: 39, type: "implement", items: [progressItem("[FIX]", "Structural support sweep — PRD N/A")] } as any;
+  const state = await importAgentResultToState(dir, batch, "implement", implementResult({
+    flags: ["E2E_ATTEMPT_FAILED_NON_BLOCKING"],
+    tests: { e2e: { command: "not applicable", exitCode: 0, evidence: "SKIPPED_NO_ENDPOINTS", required: false } }
+  }));
+  assert.deepEqual(blockingOpenFindings(state), []);
+  const gateState = recordGateState(state, [{ name: "e2e", passed: false, flags: ["E2E_ATTEMPT_FAILED_NON_BLOCKING"] }]);
+  assert.deepEqual(blockingOpenFindings(gateState), []);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("canonical finding lifecycle does not let warning-only gate reruns close hard findings", () => {
+  const opened = recordGateState({ schemaVersion: 1, batch: 34, selectedItems: [], changedFiles: [], risk: { class: "low", reasons: [] }, currentResult: implementResult(), findings: [], commands: [], gates: {}, updatedAt: new Date().toISOString() }, [
+    { name: "frontend", passed: false, flags: ["IMPECCABLE_DETECTOR_FINDINGS:1"] }
+  ]);
+  assert.deepEqual(blockingOpenFindings(opened).map((finding) => finding.id), ["IMPECCABLE_DETECTOR_FINDINGS:1"]);
+  const stillOpen = recordGateState(opened, [{ name: "frontend", passed: false, flags: ["IMPECCABLE_DETECTOR_UNAVAILABLE:detector unavailable after source reverted"] }]);
+  assert.deepEqual(blockingOpenFindings(stillOpen).map((finding) => finding.id), ["IMPECCABLE_DETECTOR_FINDINGS:1"]);
+  const closed = recordGateState(stillOpen, [{ name: "frontend", passed: true, flags: [] }]);
+  assert.deepEqual(blockingOpenFindings(closed), []);
+});
+
+test("semantic bugfix fixed flags with explanatory details close matching findings", async () => {
+  const batch = { number: 35, type: "implement", items: [progressItem("[API]", "Business rule — PRD §8")] } as any;
+  const dir = await tempDir();
+  await importAgentResultToState(dir, batch, "validate", { ...implementResult({ status: "FAILURE", failureType: "BUSINESS_LOGIC_DRIFT", flags: ["BUSINESS_LOGIC_DRIFT"] }), agent: "validate" });
+  const state = await importAgentResultToState(dir, batch, "bugfix", { ...implementResult({ agent: "bugfix", flags: ["BUSINESS_LOGIC_DRIFT_FIXED: verified by regression"], filesChanged: ["src/business.ts"] }) });
+  assert.deepEqual(blockingOpenFindings(state), []);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("semantic verified flags close matching unverified gate findings with detail", async () => {
+  const batch = { number: 45, type: "implement", items: [progressItem("[JOB]", "Queue fairness — PRD §7")] } as any;
+  const dir = await tempDir();
+  const base = await importAgentResultToState(dir, batch, "implement", implementResult());
+  const opened = recordGateState(base, [{ name: "wiring", passed: false, flags: ["ENTRYPOINT_UNVERIFIED:tenant-aware queue fairness"] }]);
+  assert.equal(blockingOpenFindings(opened).length, 1);
+  const state = await importAgentResultToState(dir, batch, "bugfix", { ...implementResult({ agent: "bugfix", flags: ["ENTRYPOINT_VERIFIED:tenant-aware queue fairness"], filesChanged: ["apps/worker/src/queues.ts", "tests/setup/batch-045-shipment-automation.vitest.ts"] }) }, opened);
+  assert.deepEqual(blockingOpenFindings(state), []);
+  assert.equal(findingSummary(state).fixed, 1);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("semantic verified flags close worker queue findings across colon detail token variants", async () => {
+  const batch = { number: 52, type: "implement", items: [progressItem("[JOB]", "Worker queues — PRD §7")] } as any;
+  const dir = await tempDir();
+  const base = await importAgentResultToState(dir, batch, "implement", implementResult());
+  const opened = recordGateState(base, [{ name: "wiring", passed: false, flags: ["ENTRYPOINT_UNVERIFIED:worker-queues"] }]);
+  assert.deepEqual(blockingOpenFindings(opened).map((finding) => finding.id), ["ENTRYPOINT_UNVERIFIED:worker-queues"]);
+  const state = await importAgentResultToState(dir, batch, "bugfix", { ...implementResult({ agent: "bugfix", flags: ["ENTRYPOINT_VERIFIED:worker queue wiring"], filesChanged: ["apps/worker/src/queues.ts", "tests/setup/batch-052-worker-queues.vitest.ts"], tests: { regression: { command: "npm test -- tests/setup/batch-052-worker-queues.vitest.ts", exitCode: 0, evidence: "worker queue wiring source regression passed" } } }) }, opened);
+  assert.deepEqual(blockingOpenFindings(state), []);
+  assert.ok(state.closureTraces?.some((trace) => trace.findingId === "ENTRYPOINT_UNVERIFIED:worker-queues" && trace.cause === "bugfix-semantic-evidence"));
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("dangerous exact non-blocking flags remain blockers", () => {
+  const gates = [{ name: "security", passed: false, flags: ["SECURITY_NON_BLOCKING"] }];
+  assert.equal(gatesPassed(gates), false);
+  const state = recordGateState({ schemaVersion: 1, batch: 46, selectedItems: [], changedFiles: [], risk: { class: "critical", reasons: [] }, currentResult: implementResult(), findings: [], commands: [], gates: {}, updatedAt: new Date().toISOString() }, gates);
+  assert.deepEqual(blockingOpenFindings(state).map((finding) => finding.id), ["SECURITY_NON_BLOCKING"]);
+});
+
+test("agent result unverified flags open canonical findings", async () => {
+  const dir = await tempDir();
+  const batch = { number: 47, type: "implement", items: [progressItem("[JOB]", "Worker wiring — PRD §7")] } as any;
+  const state = await importAgentResultToState(dir, batch, "validate", { ...implementResult({ flags: ["ENTRYPOINT_UNVERIFIED:queue worker", "BUSINESS_LOGIC_UNVERIFIED:pricing rule"] }), agent: "validate" });
+  assert.deepEqual(blockingOpenFindings(state).map((finding) => finding.id).sort(), ["BUSINESS_LOGIC_UNVERIFIED:pricing rule", "ENTRYPOINT_UNVERIFIED:queue worker"]);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("generic pass flags do not close same-root blockers or substring-prune blockers", async () => {
+  const dir = await tempDir();
+  const batch = { number: 48, type: "implement", items: [progressItem("[API]", "Auth boundary — PRD §8")] } as any;
+  await importAgentResultToState(dir, batch, "validate", { ...implementResult({ status: "FAILURE", flags: ["AUTH_BOUNDARY_GAP", "AUTHORIZATION_GAP"] }), agent: "validate" });
+  const state = await importAgentResultToState(dir, batch, "bugfix", { ...implementResult({ agent: "bugfix", flags: ["AUTH_PASS"], filesChanged: ["src/auth.ts"] }) });
+  assert.deepEqual(blockingOpenFindings(state).map((finding) => finding.id).sort(), ["AUTHORIZATION_GAP", "AUTH_BOUNDARY_GAP"]);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("specific positive evidence flags close matching unwired and business drift findings", async () => {
+  const dir = await tempDir();
+  const batch = { number: 52, type: "implement", items: [progressItem("[JOB]", "Shipment automation — PRD §7")] } as any;
+  await importAgentResultToState(dir, batch, "validate", { ...implementResult({ status: "FAILURE", flags: ["UNWIRED_WORKER_ENTRYPOINTS", "ENTRYPOINT_UNWIRED_TRACKING_EMAIL_PARSE", "QUEUE_FAIRNESS_NOT_WIRED", "BUSINESS_LOGIC_DRIFT_FALLBACK_CONFIDENCE"] }), agent: "validate" });
+  const state = await importAgentResultToState(dir, batch, "bugfix", { ...implementResult({ agent: "bugfix", flags: ["ENTRYPOINT_VERIFIED_TRACKING_EMAIL_PARSE", "ENTRYPOINT_VERIFIED_TENANT_AWARE_QUEUE_FAIRNESS", "BUSINESS_LOGIC_EVIDENCE_FALLBACK_CONFIDENCE_PASS"], filesChanged: ["apps/worker/src/index.ts", "tests/setup/batch-045-shipment-automation.vitest.ts"] }) });
+  assert.deepEqual(blockingOpenFindings(state), []);
+  assert.equal(findingSummary(state).fixed, 4);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("sweep and reverted positive flags close matching late validation findings", async () => {
+  const dir = await tempDir();
+  const batch = { number: 58, type: "implement", items: [progressItem("[JOB]", "Shipment automation — PRD §7")] } as any;
+  await importAgentResultToState(dir, batch, "validate", { ...implementResult({ status: "FAILURE", flags: ["BUSINESS_LOGIC_DRIFT_APPEND_ONLY_NOTELOG_OVERWRITE", "BUSINESS_LOGIC_DRIFT_TENANT_FAIRNESS_DROPS_RATE_LIMITED_JOBS", "GENERATED_FILE_DRIFT_UNREPORTED"] }), agent: "validate" });
+  const state = await importAgentResultToState(dir, batch, "bugfix", { ...implementResult({ agent: "bugfix", flags: ["BUSINESS_LOGIC_DRIFT_SWEEP_PASS", "TENANT_FAIRNESS_RATE_LIMIT_RETRY_PASS", "GENERATED_FILE_DRIFT_REVERTED"], filesChanged: ["apps/worker/src/queues.ts", "apps/web/next-env.d.ts"] }) });
+  assert.deepEqual(blockingOpenFindings(state), []);
+  assert.equal(findingSummary(state).fixed, 3);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("tenant fairness retry evidence closes matching drift without broad sweep", async () => {
+  const dir = await tempDir();
+  const batch = { number: 59, type: "implement", items: [progressItem("[JOB]", "Tenant queue fairness — PRD §7")] } as any;
+  await importAgentResultToState(dir, batch, "validate", { ...implementResult({ status: "FAILURE", flags: ["BUSINESS_LOGIC_DRIFT_TENANT_FAIRNESS_DROPS_RATE_LIMITED_JOBS"] }), agent: "validate" });
+  const state = await importAgentResultToState(dir, batch, "bugfix", { ...implementResult({ agent: "bugfix", flags: ["TENANT_FAIRNESS_RATE_LIMIT_RETRY_PASS"], filesChanged: ["apps/worker/src/queues.ts"] }) });
+  assert.deepEqual(blockingOpenFindings(state), []);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("stale raw flags do not reopen recovered canonical findings", async () => {
+  const dir = await tempDir();
+  const batch = { number: 53, type: "implement", items: [progressItem("[API]", "Auth boundary — PRD §8")] } as any;
+  const opened = await importAgentResultToState(dir, batch, "validate", { ...implementResult({ status: "FAILURE", flags: ["AUTH_BOUNDARY_GAP"] }), agent: "validate" });
+  assert.equal(blockingOpenFindings(opened).length, 1);
+  const fixed = await importAgentResultToState(dir, batch, "bugfix", { ...implementResult({ agent: "bugfix", flags: ["AUTH_BOUNDARY_FIXED"], filesChanged: ["src/auth.ts"] }) });
+  assert.deepEqual(blockingOpenFindings(fixed), []);
+  const replay = await importAgentResultToState(dir, batch, "validate", { ...implementResult({ status: "SUCCESS", flags: ["AUTH_BOUNDARY_GAP"], tests: { regression: { command: "npm test", exitCode: 0, evidence: "green" } } }), agent: "validate" });
+  assert.deepEqual(blockingOpenFindings(replay), []);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("validate success does not close unrelated open findings without semantic fix evidence", async () => {
+  const dir = await tempDir();
+  const batch = { number: 54, type: "implement", items: [progressItem("[DATA]", "Payment auth — PRD §5")] } as any;
+  await importAgentResultToState(dir, batch, "validate", { ...implementResult({ status: "FAILURE", flags: ["BUSINESS_LOGIC_DRIFT_PAYMENT_AUTH"] }), agent: "validate" });
+  const state = await importAgentResultToState(dir, batch, "validate", { ...implementResult({ status: "SUCCESS", tests: { regression: { command: "npm run lint", exitCode: 0, evidence: "lint passed only" } } }), agent: "validate" });
+  assert.deepEqual(blockingOpenFindings(state).map((finding) => finding.id), ["BUSINESS_LOGIC_DRIFT_PAYMENT_AUTH"]);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("latest successful validate outranks older validate failure for non-product findings", async () => {
+  const dir = await tempDir();
+  const batch = { number: 60, type: "support", items: [progressItem("[FIX]", "Runtime gate cleanup — PRD N/A")] } as any;
+  await importAgentResultToState(dir, batch, "validate", { ...implementResult({ status: "FAILURE", flags: ["RUNTIME_GATES_REJECTED", "ARTIFACT_MISSING:.yolo/gates/batch-060.md"] }), agent: "validate" });
+  const state = await importAgentResultToState(dir, batch, "validate", { ...implementResult({ status: "SUCCESS", tests: { regression: { command: "npm test", exitCode: 0, evidence: "green after runtime artifact repair" } } }), agent: "validate" });
+  assert.deepEqual(blockingOpenFindings(state), []);
+  assert.equal(findingSummary(state).fixed, 2);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("latest source-backed bugfix closes only semantically matched product findings", async () => {
+  const dir = await tempDir();
+  const batch = { number: 61, type: "implement", items: [progressItem("[API]", "Payment and tenant boundaries — PRD §8")] } as any;
+  await importAgentResultToState(dir, batch, "validate", { ...implementResult({ status: "FAILURE", flags: ["BUSINESS_LOGIC_DRIFT_PAYMENT_AUTH", "TENANT_BOUNDARY_GAP"] }), agent: "validate" });
+  const state = await importAgentResultToState(dir, batch, "bugfix", { ...implementResult({ agent: "bugfix", flags: ["BUSINESS_LOGIC_EVIDENCE_PAYMENT_AUTH_PASS"], filesChanged: ["src/payment.ts", "src/tenant.ts"], tests: { regression: { command: "npm test", exitCode: 0, evidence: "payment regression green" } } }) });
+  assert.deepEqual(blockingOpenFindings(state).map((finding) => finding.id), ["TENANT_BOUNDARY_GAP"]);
+  assert.ok(state.findings.some((finding) => finding.id === "BUSINESS_LOGIC_DRIFT_PAYMENT_AUTH" && finding.status === "fixed"));
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("runtime-only recovery with passing commands quarantines stale runtime support findings without positive flags", async () => {
+  const dir = await tempDir();
+  const batch = { number: 62, type: "support", items: [progressItem("[FIX]", "Recover runtime artifacts — PRD N/A")] } as any;
+  await importAgentResultToState(dir, batch, "validate", { ...implementResult({ status: "FAILURE", flags: ["RUNTIME_GATES_REJECTED", "PLAN_REJECTED: missing runtime gate artifact .yolo/gates/bugfix-batch-062.md", "BUSINESS_LOGIC_DRIFT_TENANT_FAIRNESS"] }), agent: "validate" });
+  const state = await importAgentResultToState(dir, batch, "bugfix", { ...implementResult({ agent: "bugfix", flags: [], filesChanged: [".yolo/batch-results/batch-062-bugfix.json", ".yolo/gates/bugfix-batch-062.md"], tests: { regression: { command: "npm test", exitCode: 0, evidence: "runtime recovery green" } } }) });
+  assert.deepEqual(state.findings.filter((finding) => finding.status === "stale").map((finding) => finding.id).sort(), ["PLAN_REJECTED: missing runtime gate artifact .yolo/gates/bugfix-batch-062.md", "RUNTIME_GATES_REJECTED"]);
+  assert.deepEqual(blockingOpenFindings(state).map((finding) => finding.id), ["BUSINESS_LOGIC_DRIFT_TENANT_FAIRNESS"]);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("old yolo artifact flags never reopen current fixed canonical state", async () => {
+  const dir = await tempDir();
+  const batch = { number: 63, type: "support", items: [progressItem("[FIX]", "Runtime artifact replay — PRD N/A")] } as any;
+  await importAgentResultToState(dir, batch, "validate", { ...implementResult({ status: "FAILURE", flags: ["ARTIFACT_MISSING:.yolo/gates/batch-063.md"] }), agent: "validate" });
+  const fixed = await importAgentResultToState(dir, batch, "bugfix", { ...implementResult({ agent: "bugfix", flags: ["ARTIFACT_MISSING_FIXED:.yolo/gates/batch-063.md"], filesChanged: [".yolo/gates/batch-063.md"], tests: { regression: { command: "npm test", exitCode: 0, evidence: "artifact exists" } } }) });
+  assert.deepEqual(blockingOpenFindings(fixed), []);
+  const staleReplay = await importAgentResultToState(dir, batch, "validate", { ...implementResult({ status: "SUCCESS", flags: ["ARTIFACT_MISSING:.yolo/gates/batch-063.md"], tests: { regression: { command: "npm test", exitCode: 0, evidence: "old artifact replay ignored" } } }), agent: "validate" });
+  assert.deepEqual(blockingOpenFindings(staleReplay), []);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("product source blockers do not auto-close from passing source bugfix without semantic evidence", async () => {
+  const dir = await tempDir();
+  const batch = { number: 64, type: "implement", items: [progressItem("[DATA]", "Tenant data isolation — PRD §4")] } as any;
+  await importAgentResultToState(dir, batch, "validate", { ...implementResult({ status: "FAILURE", flags: ["TENANT_BOUNDARY_GAP"] }), agent: "validate" });
+  const state = await importAgentResultToState(dir, batch, "bugfix", { ...implementResult({ agent: "bugfix", flags: ["NO_BLOCKING_FINDINGS"], filesChanged: ["src/tenant.ts"], tests: { regression: { command: "npm test", exitCode: 0, evidence: "generic green" } } }) });
+  assert.deepEqual(blockingOpenFindings(state).map((finding) => finding.id), ["TENANT_BOUNDARY_GAP"]);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("specific positive closure does not overreach shorter queue or business tokens", async () => {
+  const dir = await tempDir();
+  const batch = { number: 55, type: "implement", items: [progressItem("[JOB]", "Queue safety — PRD §7")] } as any;
+  await importAgentResultToState(dir, batch, "validate", { ...implementResult({ status: "FAILURE", flags: ["TENANT_AWARE_QUEUE_NOT_WIRED", "BUSINESS_LOGIC_DRIFT_PAYMENT_AUTH"] }), agent: "validate" });
+  const state = await importAgentResultToState(dir, batch, "bugfix", { ...implementResult({ agent: "bugfix", flags: ["ENTRYPOINT_VERIFIED_QUEUE", "BUSINESS_LOGIC_EVIDENCE_AUTH_PASS"], filesChanged: ["src/queue.ts"] }) });
+  assert.deepEqual(blockingOpenFindings(state).map((finding) => finding.id).sort(), ["BUSINESS_LOGIC_DRIFT_PAYMENT_AUTH", "TENANT_AWARE_QUEUE_NOT_WIRED"]);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("no findings flags are positive and non-blocking", () => {
+  const state = recordGateState({ schemaVersion: 1, batch: 56, selectedItems: [], changedFiles: [], risk: { class: "low", reasons: [] }, currentResult: implementResult(), findings: [], commands: [], gates: {}, updatedAt: new Date().toISOString() }, [{ name: "audit", passed: true, flags: ["NO_FINDINGS", "NO_BLOCKING_FINDINGS"] }]);
+  assert.deepEqual(blockingOpenFindings(state), []);
+});
+
+test("wiring verifier rejects implementation-only verifier files", async () => {
+  const dir = await tempDir();
+  await mkdir(join(dir, "src"), { recursive: true });
+  await writeFile(join(dir, "src", "worker.ts"), "export const tracking_email_parse = true;\n");
+  const batch = { number: 57, type: "implement", items: [progressItem("[JOB]", "Tracking job — PRD §7")] } as any;
+  const gate = await validateWiring(dir, batch, implementResult({ wiring: { required: true, entrypoints: [{ type: "job", path: "tracking_email_parse", verifiedBy: "src/worker.ts" }] } as any }), true);
+  assert.equal(gate.passed, false);
+  assert.ok(gate.flags.includes("ENTRYPOINT_VERIFIER_IMPLEMENTATION_ONLY:tracking_email_parse"));
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("business logic touched false cannot bypass business-tagged source changes", () => {
+  const batch = { number: 58, type: "implement", items: [progressItem("[DATA]", "Payment rules — PRD §5")] } as any;
+  const gate = validateBusinessLogic(batch, implementResult({ filesChanged: ["src/payment.ts"], businessLogic: { touched: false } as any }));
+  assert.equal(gate.passed, false);
+  assert.ok(gate.flags.includes("BUSINESS_LOGIC_UNTOUCHED_CONTRADICTS_BATCH_SCOPE"));
+});
+
+test("gatesPassed and canonical findings reject hard flags even when gate passed is true", () => {
+  const gates = [{ name: "artifacts", passed: true, flags: ["ARTIFACT_MISSING:.yolo/tests/missing.mjs"] }];
+  assert.equal(gatesPassed(gates), false);
+  assert.equal(classifyGateFindings(gates).hardFailures.length, 1);
+  const state = recordGateState({ schemaVersion: 1, batch: 49, selectedItems: [], changedFiles: [], risk: { class: "medium", reasons: [] }, currentResult: implementResult(), findings: [], commands: [], gates: {}, updatedAt: new Date().toISOString() }, gates);
+  assert.deepEqual(blockingOpenFindings(state).map((finding) => finding.id), ["ARTIFACT_MISSING:.yolo/tests/missing.mjs"]);
+});
+
+test("positive gate fix flags close matching canonical findings when gates pass by positive evidence", () => {
+  const base = { schemaVersion: 1 as const, batch: 50, selectedItems: [], changedFiles: [], risk: { class: "medium" as const, reasons: [] }, currentResult: implementResult(), findings: [], commands: [], gates: {}, updatedAt: new Date().toISOString() };
+  const opened = recordGateState(base, [{ name: "wiring", passed: false, flags: ["ENTRYPOINT_UNVERIFIED:tenant-aware queue fairness"] }]);
+  const gates = [{ name: "wiring", passed: false, flags: ["ENTRYPOINT_VERIFIED:tenant-aware queue fairness"] }];
+  assert.equal(gatesPassed(gates), true);
+  const closed = recordGateState(opened, gates);
+  assert.deepEqual(blockingOpenFindings(closed), []);
+});
+
+test("passed warning-only gate reruns do not close existing hard findings", () => {
+  const base = { schemaVersion: 1 as const, batch: 51, selectedItems: [], changedFiles: [], risk: { class: "low" as const, reasons: [] }, currentResult: implementResult(), findings: [], commands: [], gates: {}, updatedAt: new Date().toISOString() };
+  const opened = recordGateState(base, [{ name: "frontend", passed: false, flags: ["IMPECCABLE_DETECTOR_FINDINGS:1"] }]);
+  const next = recordGateState(opened, [{ name: "frontend", passed: true, flags: ["IMPECCABLE_DETECTOR_UNAVAILABLE:detector unavailable"] }]);
+  assert.deepEqual(blockingOpenFindings(next).map((finding) => finding.id), ["IMPECCABLE_DETECTOR_FINDINGS:1"]);
+});
+
+test("negative runtime rejection flags remain blocking while business-rule rejected flags are non-blocking", async () => {
+  const batch = { number: 36, type: "implement", items: [progressItem("[API]", "Reject invalid input — PRD §8")] } as any;
+  const dir = await tempDir();
+  const state = await importAgentResultToState(dir, batch, "validate", { ...implementResult({ flags: ["VALIDATOR_REJECTED", "SECURITY_REJECTED", "CROSS_ORDER_SUPPLIER_BUNDLING_REJECTED"] }), agent: "validate" });
+  assert.deepEqual(blockingOpenFindings(state).map((finding) => finding.id).sort(), ["SECURITY_REJECTED", "VALIDATOR_REJECTED"]);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("canonical state opens e2e setup-missing findings even when result claims success", async () => {
+  const dir = await tempDir();
+  const batch = { number: 1, type: "implement", items: [progressItem("[SETUP]", "Install frontend framework — PRD §3")] } as any;
+  const result = implementResult({ flags: ["e2e_setup_missing:true"], tests: { e2e: { command: "not applicable", exitCode: 0, evidence: "E2E framework is not configured yet", required: true } } });
+  const state = await importAgentResultToState(dir, batch, "implement", result);
+  assert.deepEqual(blockingOpenFindings(state).map((finding) => finding.id), ["e2e_setup_missing:true"]);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("runtime source uses canonical batch state and recovers open findings after green gates", async () => {
   const source = await readFileText(join(process.cwd(), "src/runtime.ts"));
   assert.match(source, /importAgentResultToState/);
   assert.match(source, /recordGateState/);
@@ -1337,7 +2017,8 @@ test("runtime source uses canonical batch state and blocks open findings", async
   assert.match(source, /heartbeatRuntimeLock/);
   assert.match(source, /releaseRuntimeLock/);
   assert.match(source, /gatesPassed\(gates\) && openFindings\.length > 0/);
-  assert.match(source, /handleRejected\(cwd, batch, result, openFindings\.map/);
+  assert.match(source, /recoverGateFailure\(cwd, lease\.cwd, batch, config, context, result, openFindings\.map/);
+  assert.match(source, /const remainingFindings = blockingOpenFindings\(postFindingValidation\.state\)/);
 });
 
 test("artifact validator ignores placeholder artifact paths", async () => {
@@ -1388,16 +2069,41 @@ test("full validator matrix accepts valid setup batch variants", async () => {
   await rm(dir, { recursive: true, force: true });
 });
 
-test("config merge caps stale project high thinking overrides", async () => {
+test("config merge preserves intentional high and xhigh thinking overrides", async () => {
   const dir = await tempDir();
   await mkdir(join(dir, ".yolo"), { recursive: true });
-  await writeFile(join(dir, ".yolo/runtime.config.json"), JSON.stringify({ schemaVersion: 1, models: { master: { thinking: "xhigh" }, validate: { thinking: "xhigh" }, bugfix: { thinking: "high" }, audit: { thinking: "high" }, adjudicate: { thinking: "high" } } }));
+  await writeFile(join(dir, ".yolo/runtime.config.json"), JSON.stringify({ schemaVersion: 1, models: { master: { thinking: "xhigh" }, validate: { thinking: "xhigh" }, bugfix: { thinking: "high" }, audit: { thinking: "high" }, adjudicate: { thinking: "xhigh" } } }));
   const config = await loadConfig(dir);
-  assert.equal(config.models.master.thinking, "medium");
-  assert.equal(config.models.validate.thinking, "medium");
+  assert.equal(config.models.master.thinking, "xhigh");
+  assert.equal(config.models.validate.thinking, "xhigh");
+  assert.equal(config.models.bugfix.thinking, "high");
+  assert.equal(config.models.audit.thinking, "high");
+  assert.equal(config.models.adjudicate.thinking, "xhigh");
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("config merge promotes stale generated medium judgment routes", async () => {
+  const dir = await tempDir();
+  await mkdir(join(dir, ".yolo"), { recursive: true });
+  await writeFile(join(dir, ".yolo/runtime.config.json"), JSON.stringify({ schemaVersion: 1, models: { master: { thinking: "medium" }, validate: { thinking: "medium", budget: { staleMs: 1 } }, bugfix: { thinking: "medium" }, audit: { thinking: "medium" }, adjudicate: { thinking: "medium" }, implement: { thinking: "medium" } } }));
+  const config = await loadConfig(dir);
+  assert.equal(config.models.master.thinking, "xhigh");
+  assert.equal(config.models.validate.thinking, "high");
+  assert.equal(config.models.validate.budget?.staleMs, 1);
+  assert.equal(config.models.bugfix.thinking, "high");
+  assert.equal(config.models.audit.thinking, "xhigh");
+  assert.equal(config.models.adjudicate.thinking, "xhigh");
+  assert.equal(config.models.implement.thinking, "xhigh");
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("config merge preserves explicit medium when a project pins a custom model", async () => {
+  const dir = await tempDir();
+  await mkdir(join(dir, ".yolo"), { recursive: true });
+  await writeFile(join(dir, ".yolo/runtime.config.json"), JSON.stringify({ schemaVersion: 1, models: { bugfix: { model: "local/debug-model", thinking: "medium" } } }));
+  const config = await loadConfig(dir);
+  assert.equal(config.models.bugfix.model, "local/debug-model");
   assert.equal(config.models.bugfix.thinking, "medium");
-  assert.equal(config.models.audit.thinking, "medium");
-  assert.equal(config.models.adjudicate.thinking, "medium");
   await rm(dir, { recursive: true, force: true });
 });
 
@@ -1408,6 +2114,12 @@ test("config merge preserves recovery defaults for older project configs", async
   const config = await loadConfig(dir);
   assert.equal(config.recovery?.maxBugfixAttempts, 2);
   assert.equal(config.recovery?.retryJournalOnce, true);
+  assert.equal(config.recovery?.selfHealRuntime, true);
+  assert.equal(config.recovery?.maxSelfHealAttempts, 1);
+  assert.equal(config.recovery?.repairUnreadableRuntimeState, true);
+  assert.equal(config.speed?.deterministicJournal, true);
+  assert.equal(config.speed?.observeRisk, true);
+  assert.equal(config.speed?.observeAffectedTests, true);
   await rm(dir, { recursive: true, force: true });
 });
 
@@ -1498,6 +2210,42 @@ test("support scheduler does not interrupt unfinished project work to backfill o
   items[0].checked = true;
   items[0].phase = "Phase 0";
   assert.equal(await nextSupportPlan(dir, items), null);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("support workflow instructions prevent protected coordination files from becoming refactor deliverables", async () => {
+  const prompt = await readPromptTemplate(process.cwd(), ".agent/agents/yolo/yolo-subagent-implement.md");
+  assert.match(prompt, /Support\/refactor\/modularity\/audit sweeps MUST NOT edit, recreate, delete, or list template-managed protected coordination files as deliverables/);
+  assert.match(prompt, /\.agent\/rules\/\*\*/);
+  assert.match(prompt, /AGENTS\.md/);
+  assert.match(prompt, /\.yolo\/runtime-state\.json/);
+  assert.match(prompt, /secret files/);
+});
+
+test("composite support resume fixture accepts bugfix-only recovered artifacts while preserving blockers and full-scope identity", async () => {
+  const dir = await tempDir();
+  const worktree = join(dir, ".yolo/worktrees/batch-052");
+  await mkdir(join(worktree, ".yolo/batch-results"), { recursive: true });
+  await mkdir(join(dir, ".yolo/logs"), { recursive: true });
+  const bugfix = implementResult({
+    agent: "bugfix",
+    batch: 52,
+    itemsCompleted: ["Support modularity sweep — PRD N/A"],
+    filesChanged: ["src/support/modularity.ts", "tests/runtime/support-modularity.test.ts", ".yolo/gates/bugfix-batch-052.md"],
+    flags: ["MODULARITY_RULE_FILE_LIMIT_VIOLATION:.agent/rules/support-metadata.md", "CHANGED_FILE_MISSING_METADATA_REMOVED:.agent/rules/support-metadata.md", "ENTRYPOINT_VERIFIED_SUPPORT_MODULARITY", "BUSINESS_LOGIC_EVIDENCE_SUPPORT_PASS"],
+    tests: { regression: { command: "npm test -- tests/runtime/support-modularity.test.ts", exitCode: 0, evidence: "support recovery passed" } }
+  });
+  await writeFile(join(worktree, ".yolo/batch-results/batch-052-bugfix-2.json"), JSON.stringify(bugfix));
+  await writeFile(join(dir, ".yolo/logs/runtime-2026-06-06.log"), "Continuing original full YOLO scope after resumed batch.\nSelected batch 52: Support modularity sweep — PRD N/A\n");
+
+  assert.equal(await pathExists(join(worktree, ".yolo/batch-results/batch-052-implement.json")), false);
+  assert.equal(await readLatestSuccessfulBugfixResult(worktree, 52).then(Boolean), true);
+  assert.deepEqual(await findLatestResumableBatch(dir), { batch: 52, worktree, requestedScope: "full" });
+
+  const pathGate = validatePaths([".agent/agents/yolo/yolo-subagent-support.md", "src/support/modularity.ts"], defaultConfig);
+  assert.deepEqual(pathGate.flags, ["TEMPLATE_MANAGED_PROTECTED_PATH:.agent/agents/yolo/yolo-subagent-support.md"]);
+  const state = await importAgentResultToState(worktree, { number: 52, type: "implement", items: [progressItem("[SUPPORT]", "Support modularity sweep — PRD N/A")] } as any, "bugfix", bugfix);
+  assert.equal(blockingOpenFindings(state).length, 0);
   await rm(dir, { recursive: true, force: true });
 });
 
@@ -1662,13 +2410,13 @@ test("subagent runner converts stale tool timeouts into synthetic failure result
   assert.match(source, /AGENT_STALE_TOOL_TIMEOUT/);
 });
 
-test("default model routes cap guarded roles at medium thinking", () => {
-  assert.equal(defaultConfig.models.master.thinking, "medium");
-  assert.equal(defaultConfig.models.implement.thinking, "medium");
-  assert.equal(defaultConfig.models.validate.thinking, "medium");
-  assert.equal(defaultConfig.models.bugfix.thinking, "medium");
-  assert.equal(defaultConfig.models.audit.thinking, "medium");
-  assert.equal(defaultConfig.models.adjudicate.thinking, "medium");
+test("default model routes use xhigh reasoning for instruction-heavy implement roles without raising routine roles", () => {
+  assert.equal(defaultConfig.models.master.thinking, "xhigh");
+  assert.equal(defaultConfig.models.implement.thinking, "xhigh");
+  assert.equal(defaultConfig.models.validate.thinking, "high");
+  assert.equal(defaultConfig.models.bugfix.thinking, "high");
+  assert.equal(defaultConfig.models.audit.thinking, "xhigh");
+  assert.equal(defaultConfig.models.adjudicate.thinking, "xhigh");
   assert.equal(defaultConfig.models.journal.thinking, "low");
   assert.equal(defaultConfig.models.knowledge.thinking, "medium");
   assert.equal(defaultConfig.models.inbox.thinking, "low");
@@ -1728,6 +2476,18 @@ test("bugfix recovery result merges fixed files and overrides local-only contrac
   assert.ok(recovered.flags.includes("BUGFIX_RECOVERY_APPLIED"));
 });
 
+test("bugfix recovery strips runtime-owned paths from recovered changed-file manifests", () => {
+  const implementation = implementResult();
+  implementation.filesChanged = ["src/main.ts", ".yolo/runtime/batches/batch-011/state.json"];
+  const bugfix = implementResult({ agent: "bugfix" });
+  bugfix.filesChanged = [".yolo/runtime/batches/batch-011/state.json", ".yolo/runtime-state.json", ".yolo/batch-results/batch-011-bugfix.json"];
+  const recovered = mergeRecoveredResult(implementation, bugfix);
+  assert.ok(recovered.filesChanged.includes("src/main.ts"));
+  assert.ok(!recovered.filesChanged.includes(".yolo/runtime/batches/batch-011/state.json"));
+  assert.ok(!recovered.filesChanged.includes(".yolo/runtime-state.json"));
+  assert.ok(recovered.filesChanged.includes(".yolo/batch-results/batch-011-bugfix.json"));
+});
+
 test("bugfix recovery preserves richer evidence while applying compact bugfix manifests", () => {
   const implementation = implementResult();
   implementation.failureType = "BUSINESS_LOGIC_DRIFT";
@@ -1739,6 +2499,7 @@ test("bugfix recovery preserves richer evidence while applying compact bugfix ma
     test: "tests/components/settings-validation-flow.test.tsx and tests/unit/validation/settings-validation.test.ts"
   };
   const bugfix = implementResult({ agent: "bugfix" });
+  bugfix.filesChanged = ["src/features/import/importParser.ts"];
   bugfix.businessLogic = {
     rule: "Fixed unit validation drift.",
     sourceOfTruth: "PRD §5.3",
@@ -1757,6 +2518,48 @@ test("bugfix recovery preserves richer evidence while applying compact bugfix ma
   assert.equal(recovered.tests?.regression?.command, "npm test");
   assert.ok(recovered.flags.includes("RECOVERED_SOURCE_FLAG:BUSINESS_LOGIC_DRIFT"));
   assert.ok(recovered.flags.includes("BUSINESS_LOGIC_DRIFT_FIXED"));
+});
+
+test("bugfix recovery preserves runnable passing evidence when later narrow bugfix marks checks not applicable", () => {
+  const implementation = implementResult();
+  implementation.tests = {
+    green: { command: "npm run test:unit -- tenant.test.ts", exitCode: 0, evidence: "targeted tenant tests passed" },
+    regression: { command: "npm test", exitCode: 0, evidence: "full suite passed" },
+    e2e: { required: true, command: "npm run test:e2e", exitCode: 0, evidence: "4 Playwright tests passed over real HTTP" }
+  };
+  const bugfix = implementResult({ agent: "bugfix" });
+  bugfix.tests = {
+    green: { command: "not applicable", exitCode: 0, evidence: "docs-only bugfix" },
+    regression: { command: "not applicable", exitCode: 0, evidence: "docs-only bugfix" },
+    e2e: { required: false, command: "not applicable", exitCode: 0, evidence: "docs-only bugfix" }
+  };
+  const recovered = mergeRecoveredResult(implementation, bugfix);
+  assert.equal(recovered.tests?.green?.command, "npm run test:unit -- tenant.test.ts");
+  assert.equal(recovered.tests?.regression?.command, "npm test");
+  assert.equal(recovered.tests?.e2e?.command, "npm run test:e2e");
+  assert.equal(recovered.tests?.e2e?.required, true);
+});
+
+test("bugfix recovery preserves existing passing evidence when later bugfix evidence fails", () => {
+  const implementation = implementResult();
+  implementation.tests = {
+    green: { command: "npm test", exitCode: 0, evidence: "green passed" },
+    regression: { command: "npm run regression", exitCode: 0, evidence: "regression passed" },
+    e2e: { required: true, command: "npm run e2e", exitCode: 0, evidence: "e2e passed" }
+  };
+  const bugfix = implementResult({ agent: "bugfix" });
+  bugfix.tests = {
+    green: { command: "npm test", exitCode: 1, evidence: "later narrow rerun failed" },
+    regression: { command: "not applicable", exitCode: 0, evidence: "not runnable" },
+    e2e: { required: false, command: "npm run e2e", exitCode: 1, evidence: "later e2e failed" }
+  };
+  const recovered = mergeRecoveredResult(implementation, bugfix);
+  assert.equal(recovered.tests?.green?.command, "npm test");
+  assert.equal(recovered.tests?.green?.exitCode, 0);
+  assert.equal(recovered.tests?.regression?.command, "npm run regression");
+  assert.equal(recovered.tests?.e2e?.command, "npm run e2e");
+  assert.equal(recovered.tests?.e2e?.exitCode, 0);
+  assert.equal(recovered.tests?.e2e?.required, true);
 });
 
 test("bugfix recovery preserves wiring verifier details when bugfix narrows entrypoints", () => {
@@ -1792,6 +2595,93 @@ test("gate finding classifier routes frontend quality failures to bugfix", () =>
   ]);
   assert.equal(report.hardFailures.length, 2);
   assert.deepEqual(report.hardFailures.map((finding) => finding.recommendedAction), ["bugfix", "bugfix"]);
+});
+
+test("protected template-managed rule path blockers require human/tooling instead of bugfix", () => {
+  const gates = [
+    { name: "paths", passed: false, flags: ["TEMPLATE_MANAGED_PROTECTED_PATH:.agent/rules/CODING_STANDARDS.md"] },
+    { name: "secrets", passed: false, flags: ["CHANGED_FILE_MISSING:.agent\\rules\\CODING_STANDARDS.md"] }
+  ];
+  const report = classifyGateFindings(gates);
+  assert.deepEqual(report.hardFailures.map((finding) => finding.recommendedAction), ["human", "human"]);
+  assert.equal(hasNonRecoverableRuntimeBlocker(gates.flatMap((gate) => gate.flags)), true);
+});
+
+test("missing protected blocked runtime-owned artifacts require human/tooling instead of repeated bugfix", () => {
+  const gates = [
+    { name: "artifacts", passed: false, flags: ["ARTIFACT_MISSING:.yolo/runtime/batches/batch-011/state.json"] },
+    { name: "paths", passed: false, flags: ["CHANGED_FILE_MISSING:.env.local"] },
+    { name: "wiring", passed: false, flags: ["WIRING_VERIFIER_FILE_MISSING:node_modules/pkg/index.js"] },
+    { name: "artifacts", passed: false, flags: ["ARTIFACT_MISSING:src/product-fixture.json"] }
+  ];
+  const report = classifyGateFindings(gates);
+  assert.deepEqual(report.hardFailures.map((finding) => finding.recommendedAction), ["human", "human", "human", "bugfix"]);
+  assert.equal(hasNonRecoverableRuntimeBlocker(gates.slice(0, 3).flatMap((gate) => gate.flags)), true);
+  assert.equal(hasNonRecoverableRuntimeBlocker([gates[3].flags[0]]), false);
+});
+
+test("warning-only advisory gates pass consistently across gate and finding classifiers", () => {
+  const gates = [
+    { name: "quality", passed: false, flags: ["QUALITY_WARNING:MOBILE_VIEWPORT_EVIDENCE_MISSING"] },
+    { name: "support", passed: false, flags: ["FUTURE_PHASE_SUCCESS_CRITERIA_RECORDED_AS_MANUAL_NOT_FINDINGS"] },
+    { name: "business-logic", passed: false, flags: ["BUSINESS_LOGIC_UNTOUCHED_DOCS"] },
+    { name: "e2e", passed: false, flags: ["E2E_ATTEMPT_FAILED_NON_BLOCKING"] }
+  ];
+  assert.equal(gatesPassed(gates), true);
+  const report = classifyGateFindings(gates);
+  assert.equal(report.hardFailures.length, 0);
+  assert.equal(report.warnings.length, 4);
+});
+
+test("support sync-context advisory flags for template rule modularity and removed metadata are non-blocking", async () => {
+  const gates = [
+    { name: "support", passed: false, flags: ["MODULARITY_RULE_FILE_LIMIT_VIOLATION:.agent/rules/CODING_STANDARDS_DOMAIN.md"] },
+    { name: "secrets", passed: false, flags: ["CHANGED_FILE_MISSING_METADATA_REMOVED:.agent/rules/CODEBASE_CONTEXT.md"] }
+  ];
+  assert.equal(gatesPassed(gates), true);
+  const report = classifyGateFindings(gates);
+  assert.equal(report.hardFailures.length, 0);
+  assert.equal(report.warnings.length, 1);
+  assert.equal(report.ambiguities.length, 0);
+
+  const dir = await tempDir();
+  const batch = { number: 56, type: "support", items: [progressItem("[FIX]", "Sync template-managed runtime support rules — PRD N/A")] } as any;
+  const state = await importAgentResultToState(dir, batch, "validate", { ...implementResult({ flags: gates.flatMap((gate) => gate.flags) }), agent: "validate" });
+  assert.deepEqual(blockingOpenFindings(state), []);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("source product and bare modularity and metadata flags remain blocking", () => {
+  const gates = [
+    { name: "support", passed: false, flags: ["MODULARITY_RULE_FILE_LIMIT_VIOLATION:src/services/oversized-service.ts"] },
+    { name: "support", passed: false, flags: ["MODULARITY_RULE_FILE_LIMIT_VIOLATION"] },
+    { name: "secrets", passed: false, flags: ["CHANGED_FILE_MISSING_METADATA_REMOVED:src/services/important.ts"] },
+    { name: "secrets", passed: false, flags: ["CHANGED_FILE_MISSING_METADATA_REMOVED"] },
+    { name: "support", passed: false, flags: ["MODULARITY_RULE_FILE_LIMIT_VIOLATION:src/CODING_STANDARDS_fixture.ts"] },
+    { name: "secrets", passed: false, flags: ["CHANGED_FILE_MISSING_METADATA_REMOVED:src/sync-context-report.ts"] }
+  ];
+  assert.equal(gatesPassed(gates), false);
+  const report = classifyGateFindings(gates);
+  assert.deepEqual(report.hardFailures.map((finding) => finding.message), gates.flatMap((gate) => gate.flags));
+});
+
+test("runtime batch state closes recovered advisory support flags with explicit positive recovery evidence", async () => {
+  const dir = await tempDir();
+  const batch = { number: 56, type: "support", items: [progressItem("[FIX]", "Recover protected support artifacts — PRD N/A")] } as any;
+  let state = await importAgentResultToState(dir, batch, "validate", {
+    ...implementResult({ flags: ["MODULARITY_RULE_FILE_LIMIT_VIOLATION", "CHANGED_FILE_MISSING_METADATA_REMOVED"] }),
+    agent: "validate"
+  });
+  state = await importAgentResultToState(dir, batch, "bugfix", {
+    ...implementResult({
+      filesChanged: [".yolo/batch-results/batch-056-bugfix.json", ".yolo/gates/bugfix-batch-056.md"],
+      flags: ["MODULARITY_RULE_FILE_WARNING_ROUTED_NON_BLOCKING", "PROTECTED_PATH_METADATA_REMOVED", "MISSING_CHANGED_FILE_CLAIMS_RESOLVED"],
+      tests: { regression: { command: "npm test", exitCode: 0 } as any }
+    }),
+    agent: "bugfix"
+  }, state);
+  assert.deepEqual(blockingOpenFindings(state), []);
+  await rm(dir, { recursive: true, force: true });
 });
 
 test("adjudication decisions canonicalize common aliases", async () => {
@@ -1830,6 +2720,37 @@ test("command validator adopts exact passed subagent commands with no later sour
   ].join("\n") + "\n");
   assert.equal(adoptedSessionCommandPassed(dir, "npm test"), true);
   await writeFile(session, (await readFileText(session)) + JSON.stringify({ message: { role: "assistant", content: [{ type: "toolCall", id: "call-4", name: "edit", arguments: { path: "src/app.ts" } }] } }) + "\n");
+  assert.equal(adoptedSessionCommandPassed(dir, "npm test"), false);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("command validator does not adopt bash result with nonzero exit text", async () => {
+  const dir = await tempDir();
+  await mkdir(join(dir, ".yolo/pi-sessions"), { recursive: true });
+  const session = join(dir, ".yolo/pi-sessions/batch-002-implement.jsonl");
+  await writeFile(session, [
+    JSON.stringify({ message: { role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "bash", arguments: { command: "npm test" } }] } }),
+    JSON.stringify({ message: { role: "toolResult", toolCallId: "call-1", toolName: "bash", isError: false, content: [{ type: "text", text: "Command exited with code 1" }] } })
+  ].join("\n") + "\n");
+  assert.equal(adoptedSessionCommandPassed(dir, "npm test"), false);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("command validator treats mutating find and redirection as source mutations", async () => {
+  const dir = await tempDir();
+  await mkdir(join(dir, ".yolo/pi-sessions"), { recursive: true });
+  const session = join(dir, ".yolo/pi-sessions/batch-003-implement.jsonl");
+  await writeFile(session, [
+    JSON.stringify({ message: { role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "bash", arguments: { command: "npm test" } }] } }),
+    JSON.stringify({ message: { role: "toolResult", toolCallId: "call-1", toolName: "bash", isError: false, content: [{ type: "text", text: "passed" }] } }),
+    JSON.stringify({ message: { role: "assistant", content: [{ type: "toolCall", id: "call-2", name: "bash", arguments: { command: "find src -name '*.tmp' -delete" } }] } })
+  ].join("\n") + "\n");
+  assert.equal(adoptedSessionCommandPassed(dir, "npm test"), false);
+  await writeFile(session, [
+    JSON.stringify({ message: { role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "bash", arguments: { command: "npm test" } }] } }),
+    JSON.stringify({ message: { role: "toolResult", toolCallId: "call-1", toolName: "bash", isError: false, content: [{ type: "text", text: "passed" }] } }),
+    JSON.stringify({ message: { role: "assistant", content: [{ type: "toolCall", id: "call-2", name: "bash", arguments: { command: "grep foo src/a.ts > src/generated.ts" } }] } })
+  ].join("\n") + "\n");
   assert.equal(adoptedSessionCommandPassed(dir, "npm test"), false);
   await rm(dir, { recursive: true, force: true });
 });
@@ -1899,6 +2820,136 @@ test("command validator rejects natural-language e2e recipes instead of executin
   await rm(dir, { recursive: true, force: true });
 });
 
+test("command validator rejects prose parentheticals before shell rerun", async () => {
+  const dir = await tempDir();
+  const result = journalResult({ journal_entry_written: true, gate_file_written: true });
+  result.tests = {
+    regression: {
+      command: "node -e \"process.exit(0)\" (passes locally after retry)",
+      exitCode: 0,
+      evidence: "agent added prose to the command field"
+    }
+  };
+  const gate = await validateCommandEvidence(dir, result, dir);
+  assert.equal(gate.passed, false);
+  assert.match(gate.flags[0] ?? "", /^COMMAND_RERUN_PROSE_PARENTHETICAL:regression:/);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("command validator allows shell grouping parentheticals in rerun commands", async () => {
+  const dir = await tempDir();
+  const runtimeDir = join(dir, "tools", "klevar-yolo-runtime");
+  await mkdir(runtimeDir, { recursive: true });
+  await writeFile(join(runtimeDir, "package.json"), JSON.stringify({
+    scripts: {
+      typecheck: "node -e \"process.exit(0)\"",
+      test: "node -e \"process.exit(0)\""
+    }
+  }));
+  const result = journalResult({ journal_entry_written: true, gate_file_written: true });
+  result.tests = {
+    regression: {
+      command: "node -e \"process.exit(0)\" && (cd tools/klevar-yolo-runtime && npm run typecheck && npm test) && node -e \"process.exit(0)\"",
+      exitCode: 0,
+      evidence: "runtime command reruns nested tooling checks through a shell group"
+    }
+  };
+  const gate = await validateCommandEvidence(dir, result, dir);
+  assert.equal(gate.passed, true);
+  assert.deepEqual(gate.flags, []);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("command validator reports missing host binaries without spending rerun budget", async () => {
+  const dir = await tempDir();
+  const missing = "klevar-definitely-missing-binary-xyz";
+  const result = journalResult({ journal_entry_written: true, gate_file_written: true });
+  result.tests = {
+    regression: {
+      command: `${missing} --version`,
+      exitCode: 0,
+      evidence: "agent claimed local binary existed"
+    }
+  };
+  const gate = await validateCommandEvidence(dir, result, dir);
+  assert.equal(gate.passed, false);
+  assert.deepEqual(gate.flags, [`COMMAND_RERUN_MISSING_HOST_BINARY:regression:${missing}:${missing} --version`]);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("command validator treats empty inline env assignments as missing required env, not host binaries", async () => {
+  const dir = await tempDir();
+  const result = journalResult({ journal_entry_written: true, gate_file_written: true });
+  result.tests = {
+    regression: {
+      command: "TEST_DATABASE_URL= node -e \"process.exit(0)\"",
+      exitCode: 0,
+      evidence: "agent left a required database URL blank"
+    }
+  };
+  const gate = await validateCommandEvidence(dir, result, dir);
+  assert.equal(gate.passed, false);
+  assert.deepEqual(gate.flags, ["COMMAND_RERUN_MISSING_REQUIRED_ENV:regression:TEST_DATABASE_URL:empty-assignment:TEST_DATABASE_URL= node -e \"process.exit(0)\""]);
+  assert.ok(!gate.flags.some((flag) => flag.includes("MISSING_HOST_BINARY")));
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("command validator hydrates required dev env from official local env files", async () => {
+  const dir = await tempDir();
+  await writeFile(join(dir, ".env.local"), "DATABASE_URL=postgres://placeholder:placeholder@localhost:5432/dev\nJWT_SECRET=local-dev-secret\n");
+  const result = journalResult({ journal_entry_written: true, gate_file_written: true });
+  result.tests = {
+    regression: {
+      command: "TEST_DATABASE_URL= node -e \"process.exit(process.env.TEST_DATABASE_URL ? 0 : 1)\"",
+      exitCode: 0,
+      evidence: "runtime can hydrate TEST_DATABASE_URL from local DATABASE_URL for dev reruns"
+    }
+  };
+  const gate = await validateCommandEvidence(dir, result, dir);
+  assert.equal(gate.passed, true);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("command validator strips non-required empty env assignments before host-binary detection", async () => {
+  const dir = await tempDir();
+  const result = journalResult({ journal_entry_written: true, gate_file_written: true });
+  result.tests = {
+    regression: {
+      command: "CI= node -e \"process.exit(0)\"",
+      exitCode: 0,
+      evidence: "empty non-required env assignments can be intentional command modifiers"
+    }
+  };
+  const gate = await validateCommandEvidence(dir, result, dir);
+  assert.equal(gate.passed, true);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("command validator rejects required env placeholders when the referenced host env is unset or empty", async () => {
+  const dir = await tempDir();
+  const envName = "KLEVAR_TEST_REQUIRED_DATABASE_URL_PLACEHOLDER";
+  const previous = process.env[envName];
+  delete process.env[envName];
+  const result = journalResult({ journal_entry_written: true, gate_file_written: true });
+  result.tests = {
+    regression: {
+      command: `TEST_DATABASE_URL=$${envName} node -e "process.exit(0)"`,
+      exitCode: 0,
+      evidence: "agent referenced a required database URL from the host environment"
+    }
+  };
+  const gate = await validateCommandEvidence(dir, result, dir);
+  assert.equal(gate.passed, false);
+  assert.deepEqual(gate.flags, [`COMMAND_RERUN_MISSING_REQUIRED_ENV:regression:TEST_DATABASE_URL:unset-placeholder:${envName}:TEST_DATABASE_URL=$${envName} node -e "process.exit(0)"`]);
+  process.env[envName] = "   ";
+  const emptyGate = await validateCommandEvidence(dir, result, dir);
+  assert.equal(emptyGate.passed, false);
+  assert.deepEqual(emptyGate.flags, gate.flags);
+  if (previous === undefined) delete process.env[envName];
+  else process.env[envName] = previous;
+  await rm(dir, { recursive: true, force: true });
+});
+
 test("command validator rejects foreground dev server e2e commands instead of hanging", async () => {
   const dir = await tempDir();
   const result = journalResult({ journal_entry_written: true, gate_file_written: true });
@@ -1933,6 +2984,39 @@ test("command reruns heartbeat while long commands are active", async () => {
   assert.match(processSource, /clearInterval\(heartbeat\)/);
 });
 
+test("validator scheduler skips expensive gates after cheap blockers outside safe mode", async () => {
+  const dir = await tempDir();
+  await mkdir(join(dir, ".yolo"), { recursive: true });
+  await writeFile(join(dir, ".yolo/expensive-probe.js"), "const fs=require('fs'); fs.writeFileSync('.yolo/expensive-count','1');\n");
+  const result = implementResult({ tests: { green: { command: "node .yolo/expensive-probe.js", exitCode: 0, evidence: "probe" } } });
+  const batch = { number: 1, type: "implement", items: [progressItem("[SETUP]", "Speed lane — PRD §3")] } as any;
+  const { gates } = await validateAllWithState(dir, batch, result, defaultConfig, dir);
+  assert.ok(gates.some((gate) => gate.name === "progress-contract" && !gate.passed && gate.flags.includes("MISSING_PROGRESS_MD")));
+  assert.deepEqual(gates.find((gate) => gate.name === "command-rerun"), {
+    name: "command-rerun",
+    passed: false,
+    flags: ["SKIPPED_EXPENSIVE_GATE_DUE_TO_CHEAP_BLOCKERS:progress-contract|tdd"]
+  });
+  assert.equal(await pathExists(join(dir, ".yolo/expensive-count")), false);
+  const runtimeState = JSON.parse(await readFileText(join(dir, ".yolo/runtime-state.json"))) as { speed?: { validators?: Record<string, { status: string }> } };
+  assert.equal(runtimeState.speed?.validators?.["command-rerun"]?.status, "skipped");
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("validator scheduler safe mode still runs expensive gates for complete diagnostics", async () => {
+  const dir = await tempDir();
+  await mkdir(join(dir, ".yolo"), { recursive: true });
+  await writeFile(join(dir, ".yolo/expensive-probe.js"), "const fs=require('fs'); fs.writeFileSync('.yolo/expensive-count','1');\n");
+  const result = implementResult({ tests: { green: { command: "node .yolo/expensive-probe.js", exitCode: 0, evidence: "probe" } } });
+  const batch = { number: 1, type: "implement", items: [progressItem("[SETUP]", "Speed lane — PRD §3")] } as any;
+  const config = { ...defaultConfig, validationMode: "safe" as const };
+  const { gates } = await validateAllWithState(dir, batch, result, config, dir);
+  assert.ok(gates.some((gate) => gate.name === "progress-contract" && !gate.passed));
+  assert.equal(gates.find((gate) => gate.name === "command-rerun")?.passed, true);
+  assert.equal(await readFileText(join(dir, ".yolo/expensive-count")), "1");
+  await rm(dir, { recursive: true, force: true });
+});
+
 test("command validator reuses runtime-owned successful command evidence for unchanged trees", async () => {
   const dir = await tempDir();
   await mkdir(join(dir, ".yolo"), { recursive: true });
@@ -1946,6 +3030,9 @@ test("command validator reuses runtime-owned successful command evidence for unc
   assert.equal(second.passed, true);
   assert.equal(await readFileText(join(dir, ".yolo/cache-count")), "1");
   assert.match(await readFileText(join(dir, ".yolo/command-cache.json")), /node \.yolo\/cache-probe\.js/);
+  const runtimeState = JSON.parse(await readFileText(join(dir, ".yolo/runtime-state.json"))) as { speed?: { commands?: Array<{ status: string; provenance: string }> } };
+  assert.ok(runtimeState.speed?.commands?.some((entry) => entry.provenance === "cache" && entry.status === "recorded"));
+  assert.ok(runtimeState.speed?.commands?.some((entry) => entry.provenance === "cache" && entry.status === "hit"));
   await writeFile(join(dir, "src.txt"), "changed\n");
   const third = await validateCommandEvidence(dir, result, dir);
   assert.equal(third.passed, false);
@@ -2030,6 +3117,47 @@ test("bugfix recovery prunes stale missing artifact references fixed by bugfix",
   assert.deepEqual(recovered.artifacts?.map((artifact) => artifact.path), ["docs/real.md", ".yolo/tests/repro.mjs"]);
 });
 
+test("bugfix recovery keeps stale-missing paths that the bugfix actually recreates", () => {
+  const implementation = journalResult({ journal_entry_written: true, gate_file_written: true });
+  implementation.filesChanged = ["src/foo.ts"];
+  implementation.flags = ["CHANGED_FILE_MISSING:src/foo.ts"];
+  const bugfix = journalResult({ journal_entry_written: true, gate_file_written: true });
+  bugfix.agent = "bugfix";
+  bugfix.filesChanged = ["src/foo.ts", ".yolo/batch-results/batch-001-bugfix.json"];
+  bugfix.flags = ["CHANGED_FILE_MISSING:src/foo.ts fixed by recreating the file."];
+  const recovered = mergeRecoveredResult(implementation, bugfix);
+  assert.ok(recovered.filesChanged.includes("src/foo.ts"));
+});
+
+test("bugfix recovery ignores source manifest rewrites for unrelated batch numbers", () => {
+  const implementation = journalResult({ journal_entry_written: true, gate_file_written: true });
+  implementation.batch = 12;
+  implementation.filesChanged = ["src/real.ts"];
+  const bugfix = journalResult({ journal_entry_written: true, gate_file_written: true });
+  bugfix.agent = "bugfix";
+  bugfix.batch = 12;
+  bugfix.filesChanged = [".yolo/batch-results/batch-999-implement.json"];
+  const recovered = mergeRecoveredResult(implementation, bugfix);
+  assert.ok(recovered.filesChanged.includes("src/real.ts"));
+});
+
+test("bugfix recovery preserves implementation when claimed corrected manifest is invalid", async () => {
+  const dir = await tempDir();
+  await mkdir(join(dir, ".yolo/batch-results"), { recursive: true });
+  const implementation = journalResult({ journal_entry_written: true, gate_file_written: true });
+  implementation.batch = 12;
+  implementation.agent = "implement";
+  implementation.filesChanged = ["src/real.ts"];
+  const bugfix = journalResult({ journal_entry_written: true, gate_file_written: true });
+  bugfix.agent = "bugfix";
+  bugfix.batch = 12;
+  bugfix.filesChanged = [".yolo/batch-results/batch-012-implement.json", ".yolo/batch-results/batch-012-bugfix.json"];
+  await writeFile(join(dir, ".yolo/batch-results/batch-012-implement.json"), "{ invalid json");
+  const recovered = await mergeRecoveredResultFromDisk(dir, 12, implementation, bugfix);
+  assert.ok(recovered.filesChanged.includes("src/real.ts"));
+  await rm(dir, { recursive: true, force: true });
+});
+
 test("bugfix recovery prunes stale missing changed files omitted by later bugfix", () => {
   const implementation = journalResult({ journal_entry_written: true, gate_file_written: true });
   implementation.filesChanged = ["src/legacy/oldVerifier.ts", "src/features/workspace/AppHomeRoute.tsx"];
@@ -2072,6 +3200,7 @@ test("bugfix recovery preserves canonical TDD evidence when bugfix uses named re
   };
   const bugfix = journalResult({ journal_entry_written: true, gate_file_written: true });
   bugfix.agent = "bugfix";
+  bugfix.filesChanged = ["tests/race-repro.test.ts"];
   bugfix.tests = {
     redReproducer: { command: "./gradlew race-repro", exitCode: 1, evidence: "race reproduced red" },
     greenReproducer: { command: "./gradlew race-repro", exitCode: 0, evidence: "race fixed green" },
@@ -2084,6 +3213,101 @@ test("bugfix recovery preserves canonical TDD evidence when bugfix uses named re
   assert.equal(recovered.tests?.green?.command, "./gradlew race-repro");
   assert.equal(recovered.tests?.regression?.evidence, "92 tests green");
   assert.equal(recovered.tests?.e2e?.evidence, "e2e still green");
+});
+
+test("bugfix recovery does not replace implementation RED with artifact-only bugfix RED", () => {
+  const implementation = journalResult({ journal_entry_written: true, gate_file_written: true });
+  implementation.tests = {
+    red: { command: "npm test -- supplier", exitCode: 1, evidence: "Initial feature RED failed before implementation" },
+    green: { command: "npm test -- supplier", exitCode: 0, evidence: "targeted green" },
+    regression: { command: "npm test", exitCode: 0, evidence: "full suite green" }
+  };
+  implementation.flags = ["RED evidence used initial schema/export failure before final green corrections"];
+  const bugfix = journalResult({ journal_entry_written: true, gate_file_written: true });
+  bugfix.agent = "bugfix";
+  bugfix.filesChanged = [".yolo/gates/bugfix-batch-027-contract.mjs", ".yolo/batch-results/batch-027-bugfix.json"];
+  bugfix.tests = {
+    red: { command: "node .yolo/gates/bugfix-batch-027-contract.mjs", exitCode: 1, evidence: "artifact contract missing before bugfix" },
+    green: { command: "node .yolo/gates/bugfix-batch-027-contract.mjs", exitCode: 0, evidence: "artifact contract passed" },
+    regression: { command: "npm test", exitCode: 0, evidence: "full suite green" }
+  };
+  bugfix.flags = ["RUNTIME_GATES_REJECTED_RECOVERED", "BUSINESS_LOGIC_DRIFT_FIXED"];
+  const recovered = mergeRecoveredResult(implementation, bugfix);
+  assert.equal(recovered.tests?.red?.command, "npm test -- supplier");
+  assert.ok(!recovered.flags.includes("BUSINESS_LOGIC_DRIFT_FIXED"));
+  assert.ok(!recovered.flags.includes("RECOVERED_SOURCE_FLAG:RED evidence used initial schema/export failure before final green corrections"));
+});
+
+test("artifact-only bugfix recovery preserves evidence pass flags when commands prove runtime recovery", () => {
+  const implementation = journalResult({ journal_entry_written: true, gate_file_written: true });
+  implementation.failureType = "RUNTIME_GATES_REJECTED";
+  implementation.flags = ["BUSINESS_LOGIC_DRIFT_APPEND_ONLY_NOTELOG_OVERWRITE", "BUSINESS_LOGIC_DRIFT_TENANT_FAIRNESS_DROPS_RATE_LIMITED_JOBS"];
+  const bugfix = journalResult({ journal_entry_written: true, gate_file_written: true });
+  bugfix.agent = "bugfix";
+  bugfix.filesChanged = [".yolo/batch-results/batch-045-bugfix-2.json", ".yolo/gates/bugfix-batch-045.md"];
+  bugfix.flags = ["BUSINESS_LOGIC_EVIDENCE_APPEND_ONLY_NOTELOG_PASS", "BUSINESS_LOGIC_EVIDENCE_TENANT_FAIRNESS_DELAYED_REQUEUE_PASS", "BUSINESS_LOGIC_DRIFT_FIXED"];
+  bugfix.tests = { green: { command: "npm run test:unit -- tests/setup/batch-045-runtime-contract.vitest.ts", exitCode: 0, evidence: "artifact recovery contract passed" } };
+  const recovered = mergeRecoveredResult(implementation, bugfix);
+  assert.ok(recovered.flags.includes("BUSINESS_LOGIC_EVIDENCE_APPEND_ONLY_NOTELOG_PASS"));
+  assert.ok(recovered.flags.includes("BUSINESS_LOGIC_EVIDENCE_TENANT_FAIRNESS_DELAYED_REQUEUE_PASS"));
+  assert.ok(!recovered.flags.includes("BUSINESS_LOGIC_DRIFT_FIXED"));
+});
+
+test("artifact-only bugfix recovery cannot replace business wiring or local-only evidence", () => {
+  const implementation = journalResult({ journal_entry_written: true, gate_file_written: true });
+  implementation.businessLogic = {
+    rule: "Supplier orders remain tenant-scoped and canonical status is the source of truth.",
+    sourceOfTruth: "PRD §4.7 and §8b",
+    observablePaths: ["packages/db/prisma/schema.prisma", "apps/web/app/api/supplier-orders/route.ts"],
+    test: "tests/setup/supplier-operations.vitest.ts"
+  };
+  implementation.wiring = {
+    required: true,
+    entrypoints: [{ type: "http-route", path: "POST /api/supplier-orders", verifiedBy: "tests/e2e/api/supplier-operations.spec.ts" }]
+  };
+  implementation.localOnlyFiles = ["apps/web/.next/"];
+  const bugfix = journalResult({ journal_entry_written: true, gate_file_written: true });
+  bugfix.agent = "bugfix";
+  bugfix.filesChanged = [".yolo/gates/bugfix-batch-027-contract.mjs", ".yolo/batch-results/batch-027-bugfix.json"];
+  bugfix.businessLogic = {
+    rule: "TDD recovery artifacts are structured.",
+    sourceOfTruth: ".agent/agents/yolo/yolo-honesty-checks.md",
+    observablePaths: [".yolo/batch-results/batch-027-bugfix.json"],
+    test: ".yolo/gates/bugfix-batch-027-contract.mjs"
+  };
+  bugfix.wiring = { required: false, entrypoints: [] };
+  bugfix.localOnlyFiles = [];
+  const recovered = mergeRecoveredResult(implementation, bugfix);
+  assert.equal(recovered.businessLogic?.rule, implementation.businessLogic.rule);
+  assert.deepEqual(recovered.wiring?.entrypoints, implementation.wiring.entrypoints);
+  assert.deepEqual(recovered.localOnlyFiles, ["apps/web/.next/"]);
+});
+
+test("semantic bugfix recovery can update business wiring and local-only evidence", () => {
+  const implementation = journalResult({ journal_entry_written: true, gate_file_written: true });
+  implementation.businessLogic = {
+    rule: "Original supplier invariant.",
+    sourceOfTruth: "PRD §4.7",
+    observablePaths: ["packages/db/prisma/schema.prisma"],
+    test: "tests/setup/supplier-operations.vitest.ts"
+  };
+  implementation.wiring = { required: true, entrypoints: [{ type: "http-route", path: "POST /api/supplier-orders", verifiedBy: "old test" }] };
+  implementation.localOnlyFiles = ["apps/web/.next/"];
+  const bugfix = journalResult({ journal_entry_written: true, gate_file_written: true });
+  bugfix.agent = "bugfix";
+  bugfix.filesChanged = ["apps/web/app/api/supplier-orders/route.ts", "tests/e2e/api/supplier-operations.spec.ts"];
+  bugfix.businessLogic = {
+    rule: "Supplier orders remain tenant-scoped and status transitions are canonical after fix.",
+    sourceOfTruth: "PRD §4.7 and §8b",
+    observablePaths: ["apps/web/app/api/supplier-orders/route.ts"],
+    test: "tests/e2e/api/supplier-operations.spec.ts"
+  };
+  bugfix.wiring = { required: true, entrypoints: [{ type: "http-route", path: "PATCH /api/supplier-orders/:id/status", verifiedBy: "tests/e2e/api/supplier-operations.spec.ts" }] };
+  bugfix.localOnlyFiles = [];
+  const recovered = mergeRecoveredResult(implementation, bugfix);
+  assert.equal(recovered.businessLogic?.rule, bugfix.businessLogic.rule);
+  assert.deepEqual(recovered.wiring?.entrypoints?.map((entry) => entry.path).sort(), ["PATCH /api/supplier-orders/:id/status", "POST /api/supplier-orders"]);
+  assert.deepEqual(recovered.localOnlyFiles, []);
 });
 
 test("bugfix recovery detects stale adversarial validation contradicted by recovered evidence", () => {
@@ -2122,8 +3346,37 @@ test("bugfix recovery detects stale adversarial validation contradicted by recov
   assert.equal(validationFailureContradictedByRecoveredEvidence(staleValidation, recovered, bugfix), false);
 });
 
+test("stale validation contradiction does not accept business logic drift fixed by unrelated pass flags", () => {
+  const recovered = implementResult({ flags: ["AUTH_BOUNDARY_GAP_FIXED", "REGRESSION_PASS"], tests: { e2e: { command: "npm run test:e2e", exitCode: 0, evidence: "passed", required: true } } });
+  const bugfix = implementResult({ agent: "bugfix", flags: ["AUTH_BOUNDARY_GAP_FIXED", "E2E_PASS"], tests: { green: { command: "npm test", exitCode: 0, evidence: "auth fixed" } } });
+  const validation = implementResult({ agent: "validate", status: "FAILURE", failureType: "BUSINESS_LOGIC_DRIFT", flags: ["BUSINESS_LOGIC_DRIFT"] });
+  assert.equal(validationFailureContradictedByRecoveredEvidence(validation, recovered, bugfix), false);
+});
+
+test("stale validation contradiction accepts explicitly related commercial recovered gap flags", () => {
+  const recovered = implementResult({ flags: ["COMMERCIAL_MARGIN_EVIDENCE_RECOVERED", "FULL_TEST_SUITE_PASS"], tests: { e2e: { command: "npm run test:e2e", exitCode: 0, evidence: "commercial margin browser proof passed", required: true } } });
+  const bugfix = implementResult({ agent: "bugfix", flags: ["COMMERCIAL_MARGIN_EVIDENCE_RECOVERED", "FULL_TEST_SUITE_PASS"], tests: { green: { command: "npm test", exitCode: 0, evidence: "commercial margin fixed" } } });
+  const validation = implementResult({ agent: "validate", status: "FAILURE", failureType: "COMMERCIAL_MARGIN_EVIDENCE_GAP", flags: ["COMMERCIAL_MARGIN_EVIDENCE_GAP"] });
+  assert.equal(validationFailureContradictedByRecoveredEvidence(validation, recovered, bugfix), true);
+
+  bugfix.flags = ["AUTH_BOUNDARY_GAP_FIXED", "FULL_TEST_SUITE_PASS"];
+  assert.equal(validationFailureContradictedByRecoveredEvidence(validation, recovered, bugfix), false);
+});
+
+test("recovered source flags remain non-blocking after repeated recovery merges", () => {
+  const nested = "RECOVERED_SOURCE_FLAG:RECOVERED_SOURCE_FLAG:REPLAY_EXPECTED_TOTALS_EVIDENCE_GAP_RECOVERED";
+  assert.equal(isPositiveFlag(nested), true);
+  assert.equal(isBlockingFlag(nested), false);
+});
+
+test("preserved flags are accepted as positive closure evidence", () => {
+  assert.equal(isPositiveFlag("UI_MODIFIED_ACTIONS_PRESERVED"), true);
+  assert.equal(fixedFindingPrefix("UI_MODIFIED_ACTIONS_PRESERVED"), "UI_MODIFIED_ACTIONS");
+});
+
 test("bugfix recovery can replace corrected implementation manifest fields", () => {
   const implementation = journalResult({ journal_entry_written: true, gate_file_written: true });
+  implementation.batch = 12;
   implementation.filesChanged = ["src/missing/File.java", "node_modules/"];
   implementation.localOnlyFiles = ["node_modules/"];
   const bugfix = journalResult({ journal_entry_written: true, gate_file_written: true });
@@ -2135,6 +3388,53 @@ test("bugfix recovery can replace corrected implementation manifest fields", () 
   assert.deepEqual(recovered.filesChanged, ["src/main/App.java", ".yolo/batch-results/batch-012-implement.json", ".yolo/batch-results/batch-012-bugfix-2.json"]);
   assert.deepEqual(recovered.localOnlyFiles, []);
   assert.equal(recovered.tests?.regression?.command, "true");
+});
+
+test("local-only sync rejects unsafe and excluded paths", async () => {
+  const root = await tempDir();
+  const worktree = await tempDir();
+  await mkdir(join(worktree, "tmp"), { recursive: true });
+  await writeFile(join(worktree, "tmp/report.txt"), "report");
+  await assert.rejects(() => syncLocalOnlyFilesToRoot(worktree, root, ["../escape.txt"]), /LOCAL_ONLY_PATH_UNSAFE/);
+  await assert.rejects(() => syncLocalOnlyFilesToRoot(worktree, root, [".git/config"]), /LOCAL_ONLY_PATH_UNSAFE/);
+  assert.deepEqual(await syncLocalOnlyFilesToRoot(worktree, root, ["tmp/report.txt"]), ["tmp/report.txt"]);
+  await rm(root, { recursive: true, force: true });
+  await rm(worktree, { recursive: true, force: true });
+});
+
+test("worktree sync rejects protected coordination paths instead of copying declared deliverables", async () => {
+  const root = await tempDir();
+  const worktree = await tempDir();
+  await mkdir(join(worktree, ".agent/rules"), { recursive: true });
+  await writeFile(join(worktree, ".agent/rules/CODING_STANDARDS.md"), "mutated");
+  await writeFile(join(worktree, "AGENTS.md"), "mutated");
+  await execCommand("git init && git config user.email test@example.com && git config user.name Test", worktree, 30_000);
+  await assert.rejects(() => syncWorktreeChangesToRoot(worktree, root, [".agent/rules/CODING_STANDARDS.md", "AGENTS.md"]), /WORKTREE_SYNC_REJECTED_PROTECTED_PATH:.agent\/rules\/CODING_STANDARDS.md,AGENTS.md/);
+  const gate = await validateWorktreeMergeReadiness(worktree, root, [".agent/rules/CODING_STANDARDS.md"]);
+  assert.equal(gate.passed, false);
+  assert.match(gate.flags.join("\n"), /WORKTREE_SYNC_REJECTED_PROTECTED_PATH/);
+  await rm(worktree, { recursive: true, force: true });
+  await rm(root, { recursive: true, force: true });
+});
+
+test("worktree sync ignores stale protected coordination candidates when content matches root", async () => {
+  const root = await tempDir();
+  const worktree = await tempDir();
+  await mkdir(join(root, ".agent/rules"), { recursive: true });
+  await mkdir(join(worktree, ".agent/rules"), { recursive: true });
+  await mkdir(join(worktree, "docs"), { recursive: true });
+  await writeFile(join(root, ".agent/rules/CODING_STANDARDS.md"), "canonical");
+  await writeFile(join(worktree, ".agent/rules/CODING_STANDARDS.md"), "canonical");
+  await writeFile(join(worktree, "docs/progress.md"), "initial");
+  await execCommand("git init && git config user.email test@example.com && git config user.name Test && git add . && git commit -m init", worktree, 30_000);
+  await writeFile(join(worktree, "docs/progress.md"), "done");
+  const gate = await validateWorktreeMergeReadiness(worktree, root, [".agent/rules/CODING_STANDARDS.md", "docs/progress.md"]);
+  assert.equal(gate.passed, true, gate.flags.join("\n"));
+  const synced = await syncWorktreeChangesToRoot(worktree, root, [".agent/rules/CODING_STANDARDS.md", "docs/progress.md"]);
+  assert.deepEqual(synced, ["docs/progress.md"]);
+  assert.equal(await readFile(join(root, "docs/progress.md"), "utf8"), "done");
+  await rm(worktree, { recursive: true, force: true });
+  await rm(root, { recursive: true, force: true });
 });
 
 test("worktree sync copies source, journal, and gate changes to root", async () => {
@@ -2153,23 +3453,271 @@ test("worktree sync copies source, journal, and gate changes to root", async () 
   await execCommand("git init && git config user.email test@example.com && git config user.name Test && git add . && git commit -m init", worktree, 30_000);
   await writeFile(join(worktree, "src/app.txt"), "changed");
   await writeFile(join(worktree, "src/new.txt"), "new");
+  await mkdir(join(worktree, "src/jobs"), { recursive: true });
+  await writeFile(join(worktree, "src/jobs/worker.txt"), "job");
   await writeFile(join(worktree, "docs/build-journal/001-batch.md"), "journal changed");
   await writeFile(join(worktree, ".yolo/gates/journal-batch-001.md"), "gate changed");
+  await mkdir(join(worktree, ".yolo/batch-results"), { recursive: true });
+  await mkdir(join(worktree, ".yolo/knowledge-packs"), { recursive: true });
+  await mkdir(join(worktree, ".yolo/runtime/batches/batch-001"), { recursive: true });
+  await mkdir(join(worktree, ".yolo/subagent-events"), { recursive: true });
+  await mkdir(join(worktree, "tools/klevar-yolo-runtime/src"), { recursive: true });
+  await writeFile(join(worktree, ".yolo/batch-results/batch-001-validate.json"), "{}");
+  await writeFile(join(worktree, ".yolo/gates/validate-prd.md"), "validate");
+  await writeFile(join(worktree, ".yolo/knowledge-packs/batch-001.json"), "{}");
+  await writeFile(join(worktree, ".yolo/runtime/batches/batch-001/state.json"), "{}");
+  await writeFile(join(worktree, ".yolo/subagent-events/events.jsonl"), "{}");
+  await writeFile(join(worktree, ".yolo/command-cache.json"), "{}");
+  await writeFile(join(worktree, "tools/klevar-yolo-runtime/package.json"), "{}");
+  await writeFile(join(worktree, "tools/klevar-yolo-runtime/src/runtime.ts"), "runtime");
   await writeFile(join(worktree, ".env.local"), "local=true");
-  const synced = await syncWorktreeChangesToRoot(worktree, root, ["src/app.txt", "src/new.txt", "docs/build-journal/001-batch.md", ".github/workflows/ci.yml", ".git/hooks/pre-commit", ".yolo/gates/journal-batch-001.md"]);
+  const synced = await syncWorktreeChangesToRoot(worktree, root, ["src/app.txt", "src/new.txt", "src/jobs/worker.txt", "docs/build-journal/001-batch.md", ".github/workflows/ci.yml", ".git/hooks/pre-commit", ".yolo/gates/journal-batch-001.md", "tools/klevar-yolo-runtime/src/runtime.ts"]);
   const localSynced = await syncLocalOnlyFilesToRoot(worktree, root, [".env.local"]);
   assert.ok(synced.includes("src/app.txt"));
   assert.ok(synced.includes("src/new.txt"));
+  assert.ok(synced.includes("src/jobs/worker.txt"));
   assert.ok(synced.includes("docs/build-journal/001-batch.md"));
   assert.ok(synced.includes(".github/workflows/ci.yml"));
   assert.ok(!synced.includes(".git/hooks/pre-commit"));
   assert.ok(synced.includes(".yolo/gates/journal-batch-001.md"));
+  assert.ok(synced.includes("tools/klevar-yolo-runtime/src/runtime.ts"));
   assert.equal(await readFileText(join(root, "src/app.txt")), "changed");
   assert.deepEqual(localSynced, [".env.local"]);
   assert.equal(await readFileText(join(root, "docs/build-journal/001-batch.md")), "journal changed");
   assert.equal(await readFileText(join(root, ".github/workflows/ci.yml")), "ci");
   assert.equal(existsSync(join(root, ".git/hooks/pre-commit")), false);
   assert.equal(await readFileText(join(root, ".env.local")), "local=true");
+  await rm(root, { recursive: true, force: true });
+  await rm(worktree, { recursive: true, force: true });
+});
+
+test("worktree sync ignores declared runtime-owned control-plane paths", async () => {
+  const root = await tempDir();
+  const worktree = await tempDir();
+  await mkdir(join(worktree, ".yolo/runtime/batches/batch-001"), { recursive: true });
+  await writeFile(join(worktree, ".yolo/runtime/batches/batch-001/state.json"), "{}");
+  await writeFile(join(worktree, ".yolo/runtime-state.json"), "{}");
+  await execCommand("git init && git config user.email test@example.com && git config user.name Test", worktree, 30_000);
+  const synced = await syncWorktreeChangesToRoot(worktree, root, [".yolo/runtime/batches/batch-001/state.json", ".yolo/runtime-state.json"]);
+  assert.deepEqual(synced, []);
+  assert.equal(existsSync(join(root, ".yolo/runtime/batches/batch-001/state.json")), false);
+  assert.equal(existsSync(join(root, ".yolo/runtime-state.json")), false);
+  await rm(root, { recursive: true, force: true });
+  await rm(worktree, { recursive: true, force: true });
+});
+
+test("merge-readiness gate reports undeclared material changes without copying", async () => {
+  const root = await tempDir();
+  const worktree = await tempDir();
+  await mkdir(join(worktree, "src"), { recursive: true });
+  await writeFile(join(worktree, "src/declared.txt"), "declared");
+  await execCommand("git init && git config user.email test@example.com && git config user.name Test && git add . && git commit -m init", worktree, 30_000);
+  await writeFile(join(worktree, "src/declared.txt"), "declared changed");
+  await writeFile(join(worktree, "src/undeclared.txt"), "undeclared material");
+  const gate = await validateWorktreeMergeReadiness(worktree, root, ["src/declared.txt"]);
+  assert.equal(gate.passed, false);
+  assert.match(gate.flags.join("\n"), /MERGE_READINESS_FAILED:WORKTREE_CHANGED_FILES_UNDECLARED:src\/undeclared.txt/);
+  assert.equal(existsSync(join(root, "src/declared.txt")), false);
+  await rm(root, { recursive: true, force: true });
+  await rm(worktree, { recursive: true, force: true });
+});
+
+test("merge-readiness gate ignores undeclared generated drift and accepts declared directories", async () => {
+  const root = await tempDir();
+  const worktree = await tempDir();
+  await mkdir(join(worktree, "src/features"), { recursive: true });
+  await mkdir(join(worktree, "apps/web/.next/cache"), { recursive: true });
+  await writeFile(join(worktree, "src/features/route.ts"), "base");
+  await writeFile(join(worktree, "apps/web/.next/cache/meta.json"), "generated");
+  await execCommand("git init && git config user.email test@example.com && git config user.name Test && git add . && git commit -m init", worktree, 30_000);
+  await writeFile(join(worktree, "src/features/route.ts"), "semantic change");
+  await writeFile(join(worktree, "apps/web/.next/cache/meta.json"), "generated drift");
+  const gate = await validateWorktreeMergeReadiness(worktree, root, ["src/features/"]);
+  assert.equal(gate.passed, true, gate.flags.join("\n"));
+  await rm(root, { recursive: true, force: true });
+  await rm(worktree, { recursive: true, force: true });
+});
+
+test("merge-readiness gate allows identical dirty root source and blocks divergent source", async () => {
+  const root = await tempDir();
+  const worktree = await tempDir();
+  await mkdir(join(root, "src"), { recursive: true });
+  await writeFile(join(root, "src/app.txt"), "old");
+  await execCommand("git init && git config user.email test@example.com && git config user.name Test && git add . && git commit -m init", root, 30_000);
+  await writeFile(join(root, "src/app.txt"), "same change");
+  await mkdir(join(worktree, "src"), { recursive: true });
+  await writeFile(join(worktree, "src/app.txt"), "old");
+  await execCommand("git init && git config user.email test@example.com && git config user.name Test && git add . && git commit -m init", worktree, 30_000);
+  await writeFile(join(worktree, "src/app.txt"), "same change");
+  const identical = await validateWorktreeMergeReadiness(worktree, root, ["src/app.txt"]);
+  assert.equal(identical.passed, true, identical.flags.join("\n"));
+  await writeFile(join(worktree, "src/app.txt"), "different worktree change");
+  const divergent = await validateWorktreeMergeReadiness(worktree, root, ["src/app.txt"]);
+  assert.equal(divergent.passed, false);
+  assert.match(divergent.flags.join("\n"), /ROOT_DIRTY_PATH_CONFLICT:src\/app.txt/);
+  await rm(root, { recursive: true, force: true });
+  await rm(worktree, { recursive: true, force: true });
+});
+
+test("merge-readiness gate allows runtime artifact conflicts and blocks source conflicts", async () => {
+  const root = await tempDir();
+  const worktree = await tempDir();
+  await mkdir(join(root, ".yolo/gates"), { recursive: true });
+  await mkdir(join(root, "src"), { recursive: true });
+  await writeFile(join(root, ".yolo/gates/e2e-batch-001.md"), "dirty root gate");
+  await writeFile(join(root, "src/app.txt"), "root");
+  await execCommand("git init && git config user.email test@example.com && git config user.name Test && git add . && git commit -m init", root, 30_000);
+  await writeFile(join(root, ".yolo/gates/e2e-batch-001.md"), "dirty root gate changed");
+  await writeFile(join(root, "src/app.txt"), "dirty root source");
+  await mkdir(join(worktree, ".yolo/gates"), { recursive: true });
+  await mkdir(join(worktree, "src"), { recursive: true });
+  await writeFile(join(worktree, ".yolo/gates/e2e-batch-001.md"), "worktree gate base");
+  await execCommand("git init && git config user.email test@example.com && git config user.name Test && git add . && git commit -m init", worktree, 30_000);
+  await writeFile(join(worktree, ".yolo/gates/e2e-batch-001.md"), "worktree gate");
+  const gateOnly = await validateWorktreeMergeReadiness(worktree, root, [".yolo/gates/e2e-batch-001.md"]);
+  assert.equal(gateOnly.passed, true);
+  await writeFile(join(worktree, "src/app.txt"), "worktree source");
+  const sourceConflict = await validateWorktreeMergeReadiness(worktree, root, ["src/app.txt"]);
+  assert.equal(sourceConflict.passed, false);
+  assert.match(sourceConflict.flags.join("\n"), /ROOT_DIRTY_PATH_CONFLICT:src\/app.txt/);
+  await rm(root, { recursive: true, force: true });
+  await rm(worktree, { recursive: true, force: true });
+});
+
+test("runtime source runs merge-readiness before journal in normal and continue flows", async () => {
+  const source = await readFileText(join(process.cwd(), "src/runtime.ts"));
+  assert.match(source, /runMergeReadinessGate\(cwd, lease\.cwd, batch, config, batchState, result\)/);
+  assert.match(source, /runMergeReadinessGate\(cwd, worktree, batch, config, batchState, result\)/);
+  assert.ok(source.indexOf("runMergeReadinessGate(cwd, lease.cwd") < source.indexOf("reuseOrRunJournalAgent(cwd, lease.cwd"));
+  assert.ok(source.indexOf("runMergeReadinessGate(cwd, worktree") < source.indexOf("reuseOrRunJournalAgent(cwd, worktree"));
+});
+
+test("incident replay fixtures cover runtime-only recovery metadata", async () => {
+  const fixture = await tempDir();
+  const implementation = implementResult();
+  implementation.filesChanged = ["src/main.ts", ".yolo/runtime/batches/batch-011/state.json"];
+  const bugfix = implementResult({ agent: "bugfix" });
+  bugfix.filesChanged = [".yolo/runtime/batches/batch-011/state.json", ".yolo/batch-results/batch-011-bugfix.json"];
+  await writeFile(join(fixture, "scenario.json"), JSON.stringify({
+    kind: "recovery-merge",
+    implementation,
+    bugfix,
+    expectedFilesChanged: ["src/main.ts", ".yolo/batch-results/batch-011-bugfix.json"],
+    forbiddenFilesChanged: [".yolo/runtime/batches/batch-011/state.json"]
+  }, null, 2));
+  const result = await replayIncidentFixture(fixture);
+  assert.equal(result.passed, true);
+  await rm(fixture, { recursive: true, force: true });
+});
+
+test("release gate fails closed when required acceptance surfaces are missing", async () => {
+  const root = await tempDir();
+  const result = await runReleaseGate({ root, skipSandbox: true });
+  assert.equal(result.passed, false);
+  assert.match(formatReleaseGateResult(result), /FAIL release\/stabilization gate/);
+  assert.match(formatReleaseGateResult(result), /Release gate failed closed/);
+  assert.ok(result.steps.some((step) => step.name === "runtime npm test" && step.status === "fail"));
+  assert.ok(result.steps.some((step) => step.name === "pi package npm test" && step.status === "fail"));
+  assert.ok(result.steps.some((step) => step.name === "incident replay suite" && step.status === "fail"));
+  await rm(root, { recursive: true, force: true });
+});
+
+test("poisoned-batch incident fixture captures state logs results gates and worktree status", async () => {
+  const root = await tempDir();
+  const worktree = join(root, ".yolo/worktrees/batch-004");
+  await mkdir(join(root, ".yolo/logs"), { recursive: true });
+  await mkdir(join(root, ".yolo/batch-results"), { recursive: true });
+  await mkdir(join(root, ".yolo/gates"), { recursive: true });
+  await mkdir(join(worktree, ".yolo/batch-results"), { recursive: true });
+  await mkdir(join(worktree, ".yolo/gates"), { recursive: true });
+  await writeFile(join(root, ".yolo/runtime-state.json"), JSON.stringify({ batch: 4, status: "failed", worktree }, null, 2));
+  await writeFile(join(root, ".yolo/logs/runtime-2026-06-07.log"), "runtime failure log");
+  await writeFile(join(root, ".yolo/batch-results/batch-004-implement.json"), "{\"status\":\"FAILURE\"}");
+  await writeFile(join(root, ".yolo/gates/tdd-batch-004.md"), "FAIL");
+  await writeFile(join(worktree, ".yolo/batch-results/batch-004-bugfix.json"), "{\"status\":\"FAILURE\"}");
+  await writeFile(join(worktree, ".yolo/gates/bugfix-batch-004.md"), "FAIL");
+  await execCommand("git init && git config user.email test@example.com && git config user.name Test && git add . && git commit -m init", worktree, 30_000);
+  await writeFile(join(worktree, "changed.txt"), "dirty");
+  const fixture = await capturePoisonedBatchIncidentFixture(root, { number: 4, type: "implement", items: [] }, implementResult({ status: "FAILURE", failureType: "RUNTIME_GATES_REJECTED" }), ["RUNTIME_GATES_REJECTED"]);
+  const manifest = JSON.parse(await readFileText(fixture.manifestPath));
+  assert.equal(manifest.kind, "poisoned-batch-exit");
+  assert.ok(fixture.copied.some((file) => file.includes("runtime-state.json")));
+  assert.ok(fixture.copied.some((file) => file.includes("runtime-2026-06-07.log")));
+  assert.ok(fixture.copied.some((file) => file.includes("batch-004-implement.json")));
+  assert.ok(fixture.copied.some((file) => file.includes("tdd-batch-004.md")));
+  assert.ok(fixture.copied.some((file) => file.startsWith("worktreeResults/.yolo__worktrees__batch-004__")));
+  assert.ok(fixture.copied.every((file) => !file.includes(".yolo/worktrees/")), fixture.copied.join("\n"));
+  assert.ok(fixture.copied.includes("worktree-status.txt"));
+  assert.match(await readFileText(join(fixture.dir, "worktree-status.txt")), /changed\.txt/);
+  await rm(root, { recursive: true, force: true });
+});
+
+test("known live runtime incident fixtures replay expected classifications", async () => {
+  const fixturesRoot = join(process.cwd(), "src/__fixtures__/incidents");
+  const fixtureNames = [
+    "billbee-b056-protected-path-stale-metadata",
+    "billbee-b065-plan-rejected-support-loop",
+    "commercial-b016-stale-recovery-poisoned-exit",
+    "field-service-undeclared-changed-files",
+    "trade-compliance-runtime-only-path-leakage"
+  ];
+  assert.deepEqual((await readdir(fixturesRoot)).filter((name) => fixtureNames.includes(name)).sort(), fixtureNames.sort());
+  for (const fixtureName of fixtureNames) {
+    const result = await replayIncidentFixture(join(fixturesRoot, fixtureName));
+    assert.equal(result.passed, true, `${fixtureName}\n${result.details.join("\n")}`);
+  }
+});
+
+test("incident replay fixtures cover undeclared material worktree sync failures", async () => {
+  const fixture = await tempDir();
+  const root = join(fixture, "root");
+  const worktree = join(fixture, "worktree");
+  await mkdir(join(worktree, "src"), { recursive: true });
+  await mkdir(root, { recursive: true });
+  await writeFile(join(worktree, "src/declared.txt"), "declared");
+  await execCommand("git init && git config user.email test@example.com && git config user.name Test && git add . && git commit -m init", worktree, 30_000);
+  await writeFile(join(worktree, "src/declared.txt"), "declared changed");
+  await writeFile(join(worktree, "src/undeclared.txt"), "undeclared material change");
+  await writeFile(join(fixture, "scenario.json"), JSON.stringify({
+    kind: "worktree-sync",
+    candidatePaths: ["src/declared.txt"],
+    expectedErrorIncludes: "WORKTREE_CHANGED_FILES_UNDECLARED:src/undeclared.txt"
+  }, null, 2));
+  const result = await replayIncidentFixture(fixture);
+  assert.equal(result.passed, true, result.details.join("\n"));
+  await rm(fixture, { recursive: true, force: true });
+});
+
+test("worktree sync allows runtime-owned root artifact conflicts but blocks source conflicts", async () => {
+  const root = await tempDir();
+  const worktree = await tempDir();
+  await mkdir(join(root, ".yolo/batch-results"), { recursive: true });
+  await mkdir(join(root, ".yolo/gates"), { recursive: true });
+  await mkdir(join(root, "src"), { recursive: true });
+  await writeFile(join(root, ".yolo/batch-results/batch-014-implement.json"), "old");
+  await writeFile(join(root, ".yolo/gates/e2e-batch-014.md"), "old");
+  await writeFile(join(root, "src/app.txt"), "old");
+  await execCommand("git init && git config user.email test@example.com && git config user.name Test && git add . && git commit -m init", root, 30_000);
+  await writeFile(join(root, ".yolo/batch-results/batch-014-implement.json"), "dirty root");
+  await writeFile(join(root, ".yolo/gates/e2e-batch-014.md"), "dirty root");
+
+  await mkdir(join(worktree, ".yolo/batch-results"), { recursive: true });
+  await mkdir(join(worktree, ".yolo/gates"), { recursive: true });
+  await mkdir(join(worktree, "src"), { recursive: true });
+  await writeFile(join(worktree, ".yolo/batch-results/batch-014-implement.json"), "old");
+  await writeFile(join(worktree, ".yolo/gates/e2e-batch-014.md"), "old");
+  await writeFile(join(worktree, "src/app.txt"), "old");
+  await execCommand("git init && git config user.email test@example.com && git config user.name Test && git add . && git commit -m init", worktree, 30_000);
+  await writeFile(join(worktree, ".yolo/batch-results/batch-014-implement.json"), "worktree");
+  await writeFile(join(worktree, ".yolo/gates/e2e-batch-014.md"), "worktree");
+
+  const synced = await syncWorktreeChangesToRoot(worktree, root, [".yolo/batch-results/batch-014-implement.json", ".yolo/gates/e2e-batch-014.md"]);
+  assert.deepEqual(synced.sort(), [".yolo/batch-results/batch-014-implement.json", ".yolo/gates/e2e-batch-014.md"].sort());
+  assert.equal(await readFileText(join(root, ".yolo/batch-results/batch-014-implement.json")), "worktree");
+
+  await writeFile(join(worktree, "src/app.txt"), "worktree");
+  await writeFile(join(root, "src/app.txt"), "dirty root source");
+  await assert.rejects(() => syncWorktreeChangesToRoot(worktree, root, ["src/app.txt"]), /ROOT_DIRTY_PATH_CONFLICT:src\/app\.txt/);
   await rm(root, { recursive: true, force: true });
   await rm(worktree, { recursive: true, force: true });
 });
@@ -2324,6 +3872,13 @@ test("undo-last dry-runs arbitrary HEAD commits", async () => {
   await rm(dir, { recursive: true, force: true });
 });
 
+test("cli help path keeps runtime modules lazy before argument parsing", async () => {
+  const source = await readFileText(join(process.cwd(), "src/cli.ts"));
+  assert.doesNotMatch(source, /^import \{[^\n]+\} from "\.\/(runtime|telemetry|agent-session|config|recovery|replay|release-gate|worktree-retention)\.js";/m);
+  assert.match(source, /if \(args\.includes\("--help"\) \|\| args\.includes\("-h"\)\) \{\n    console\.log\(helpText\(\)\);\n    return;\n  \}/);
+  assert.match(source, /await import\("\.\/runtime\.js"\)/);
+});
+
 test("cli unknown scope exits without mutating runtime state", async () => {
   const dir = await tempDir();
   await mkdir(join(dir, ".yolo"), { recursive: true });
@@ -2342,8 +3897,22 @@ test("continue path recognizes already committed batches before replaying stale 
   await execCommand("git add . && git commit -m init", dir, 30_000);
   await writeFile(join(dir, "README.md"), "x\ny");
   await execCommand("git add . && git commit -m 'feat(yolo): complete batch 011'", dir, 30_000);
+  for (let i = 0; i < 55; i += 1) {
+    await writeFile(join(dir, "README.md"), `x\ny\n${i}`);
+    await execCommand(`git add . && git commit -m filler-${i}`, dir, 30_000);
+  }
   assert.equal(await completedBatchCommitExists(dir, 11), true);
   assert.equal(await completedBatchCommitExists(dir, 12), false);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("runtime lock acquisition is reentrant for same process continuation", async () => {
+  const dir = await tempDir();
+  const first = acquireRuntimeLock(dir, "continue");
+  assert.equal(first.ok, true);
+  const second = acquireRuntimeLock(dir, "full");
+  assert.equal(second.ok, true);
+  releaseRuntimeLock(dir);
   await rm(dir, { recursive: true, force: true });
 });
 
@@ -2366,6 +3935,16 @@ test("continue path can infer latest resumable worktree after state loss", async
   await rm(dir, { recursive: true, force: true });
 });
 
+test("continue path can infer latest resumable audit worktree after state loss", async () => {
+  const dir = await tempDir();
+  const worktree = join(dir, ".yolo/worktrees/batch-018");
+  await mkdir(join(worktree, ".yolo/batch-results"), { recursive: true });
+  await writeFile(join(worktree, ".yolo/batch-results/batch-018-audit.json"), JSON.stringify({ schemaVersion: 1, agent: "audit", batch: 18, status: "SUCCESS", itemsCompleted: [], filesChanged: [], flags: [] }));
+  const inferred = await findLatestResumableBatch(dir);
+  assert.equal(inferred?.batch, 18);
+  await rm(dir, { recursive: true, force: true });
+});
+
 test("continue path preserves support workflow batch identity", async () => {
   const source = await readFileText(join(process.cwd(), "src/runtime.ts"));
   assert.match(source, /supportPlanFromRuntimeState/);
@@ -2379,6 +3958,21 @@ test("continue path uses inferred batch when failed state has no valid worktree"
   assert.match(source, /const stateWorktree = state\?\.worktree/);
   assert.match(source, /stateWorktree \? Number\(state\?\.batch/);
   assert.match(source, /Number\(inferred\?\.batch \?\? state\?\.batch/);
+});
+
+test("continue path recovers open canonical findings even when gates pass", async () => {
+  const source = await readFileText(join(process.cwd(), "src/runtime.ts"));
+  assert.match(source, /Continuing from existing worktree result/);
+  assert.match(source, /gatesPassed\(gates\) && openFindings\.length > 0/);
+  assert.match(source, /recoverGateFailure\(cwd, worktree, batch, config, context, result, openFindings\.map/);
+  assert.match(source, /const remainingFindings = blockingOpenFindings\(postFindingValidation\.state\)/);
+});
+
+test("parallel runtime rejects shards with open canonical findings even when gates pass", async () => {
+  const source = await readFileText(join(process.cwd(), "src/runtime.ts"));
+  assert.match(source, /const openFindingFlags: string\[\] = \[\]/);
+  assert.match(source, /PARALLEL_\$\{shard\}_OPEN_FINDING:\$\{finding\.id\}/);
+  assert.match(source, /failed\.length \|\| openFindingFlags\.length/);
 });
 
 test("continue path does not fail a fresh active batch before result exists", async () => {
@@ -2396,10 +3990,17 @@ test("continue path restarts stale active batches without result artifacts", asy
   assert.doesNotMatch(source, /state\?\.status === "running" && !\(await exists\(resultFile\)\)[\s\S]{0,220}return;/);
 });
 
-test("continue path can reuse existing valid journal artifacts", async () => {
+test("continue path can reuse existing valid journal retry artifacts", async () => {
   const source = await readFileText(join(process.cwd(), "src/runtime.ts"));
   assert.match(source, /reuseOrRunJournalAgent/);
   assert.match(source, /Reusing existing valid journal artifacts/);
+  assert.match(source, /batch-\$\{padded\}-journal-retry\.json/);
+});
+
+test("continue path merges bugfix results in numeric attempt order", async () => {
+  const source = await readFileText(join(process.cwd(), "src/runtime.ts"));
+  assert.match(source, /sort\(\(a, b\) => bugfixJsonOrder\(a\) - bugfixJsonOrder\(b\)/);
+  assert.match(source, /function bugfixJsonOrder/);
 });
 
 test("runtime does not write orphan inbox gate for empty completion probe batches", async () => {
@@ -2412,6 +4013,16 @@ test("runtime source dispatches bugfix recovery for runtime gate failures", asyn
   assert.match(source, /recoverGateFailure/);
   assert.match(source, /RUNTIME_GATES_REJECTED/);
   assert.match(source, /Re-running runtime gates after gate-failure bugfix recovery/);
+  assert.match(source, /const openFindings = blockingOpenFindings\(validation\.state\)/);
+  assert.match(source, /gatesPassed\(gates\) && openFindings\.length === 0/);
+  assert.match(source, /openFindings\.map\(\(finding\) => finding\.id\)/);
+});
+
+test("runtime source treats protected path blockers as non-recoverable before bugfix dispatch", async () => {
+  const source = await readFileText(join(process.cwd(), "src/runtime.ts"));
+  assert.match(source, /requiresHumanSecurityApproval\(flags\) \|\| hasNonRecoverableRuntimeBlocker\(flags\)/);
+  assert.match(source, /hasNonRecoverableRuntimeBlocker\(currentFlags\)/);
+  assert.match(source, /requires human\/security approval or tooling intervention/);
 });
 
 test("runtime attempts bugfix recovery for audit and validation failures before user escalation", async () => {
@@ -2428,7 +4039,142 @@ test("bugfix recovery budget resets for distinct failure signatures", async () =
   assert.match(source, /function failureSignature\(flags: string\[\], failureType\?: string \| null\)/);
   assert.match(source, /let currentSignature = failureSignature\(currentFlags, currentValidation\.failureType\)/);
   assert.match(source, /if \(nextSignature !== currentSignature\) \{[\s\S]{0,120}attemptForSignature = 0;/);
-  assert.match(source, /runBugfixAgent\(rootCwd, cwd, batch, config, context, currentValidation, currentFlags, totalAttempts\)/);
+  assert.match(source, /const recoveryFlags = blockingRecoveryFlags\(currentFlags, currentValidation\.failureType\)/);
+  assert.match(source, /runBugfixAgent\(rootCwd, cwd, batch, config, context, currentValidation, recoveryFlags, totalAttempts\)/);
+});
+
+test("bugfix recovery signatures ignore runtime recovery meta flags", () => {
+  const signature = failureSignature(["RUNTIME_GATES_REJECTED_RECOVERED", "BUGFIX_RECOVERY_APPLIED", "RECOVERED_FROM:RUNTIME_GATES_REJECTED", "RED evidence used initial schema/export failure before final green corrections"], "VALIDATOR_REJECTED");
+  assert.equal(signature, "RED evidence used initial schema/export failure before final green corrections|VALIDATOR_REJECTED");
+});
+
+test("runtime batch findings ignore runtime recovery meta flags", async () => {
+  const dir = await tempDir();
+  const batch = { number: 27, type: "implement" as const, items: [{ tag: "[API]", title: "Supplier operations", raw: "- [ ] [API] Supplier operations", phase: "Phase 1", checked: false }] };
+  const result = implementResult({ agent: "bugfix", flags: ["RUNTIME_GATES_REJECTED_RECOVERED", "BUGFIX_RECOVERY_APPLIED"] });
+  const state = await importAgentResultToState(dir, batch, "bugfix", result);
+  assert.deepEqual(blockingOpenFindings(state), []);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("canonical state closes retained positive recovered flags instead of counting them open", async () => {
+  const dir = await tempDir();
+  const batch = { number: 28, type: "implement" as const, items: [{ tag: "[API]", title: "Supplier operations", raw: "- [ ] [API] Supplier operations", phase: "Phase 1", checked: false }] };
+  const previous = {
+    schemaVersion: 1 as const,
+    batch: 28,
+    selectedItems: [],
+    changedFiles: [],
+    risk: { class: "medium" as const, reasons: [] },
+    currentResult: implementResult(),
+    findings: [{ id: "COMMERCIAL_MARGIN_EVIDENCE_RECOVERED", source: "bugfix", status: "open" as const, evidence: [], lastCheckedAt: new Date().toISOString() }],
+    commands: [],
+    gates: {},
+    updatedAt: new Date().toISOString()
+  };
+  const state = await importAgentResultToState(dir, batch, "implement", implementResult({ flags: ["BUSINESS_LOGIC_DRIFT_MARGIN"] }), previous);
+  assert.equal(state.findings.find((finding) => finding.id === "COMMERCIAL_MARGIN_EVIDENCE_RECOVERED")?.status, "fixed");
+  assert.deepEqual(blockingOpenFindings(state).map((finding) => finding.id), ["BUSINESS_LOGIC_DRIFT_MARGIN"]);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("passing runtime-only recovery quarantines stale runtime-owned findings but preserves product blockers", async () => {
+  const dir = await tempDir();
+  const batch = { number: 65, type: "implement" as const, items: [{ tag: "[API]", title: "Supplier operations", raw: "- [ ] [API] Supplier operations", phase: "Phase 1", checked: false }] };
+  const opened = recordGateState({ schemaVersion: 1, batch: 65, selectedItems: [], changedFiles: [], risk: { class: "high", reasons: [] }, currentResult: implementResult(), findings: [], commands: [], gates: {}, updatedAt: new Date().toISOString() }, [
+    { name: "contract", passed: false, flags: ["ARTIFACT_MISSING:.yolo/gates/bugfix-batch-065.md", "PLAN_REJECTED: missing runtime gate artifact .yolo/gates/bugfix-batch-065.md", "BUSINESS_LOGIC_DRIFT_PAYMENT_AUTH"] }
+  ]);
+  const recovered = await importAgentResultToState(dir, batch, "bugfix", implementResult({
+    agent: "bugfix",
+    filesChanged: [".yolo/batch-results/batch-065-bugfix.json", ".yolo/gates/bugfix-batch-065.md"],
+    tests: { green: { command: "npm test -- tests/runtime/recovery-contract.test.ts", exitCode: 0, evidence: "runtime recovery contract passed" } },
+    flags: ["RUNTIME_GATES_REJECTED_RECOVERED", "BUGFIX_RECOVERY_APPLIED"]
+  }), opened);
+  assert.deepEqual(blockingOpenFindings(recovered).map((finding) => finding.id), ["BUSINESS_LOGIC_DRIFT_PAYMENT_AUTH"]);
+  assert.deepEqual(recovered.findings.filter((finding) => finding.status === "stale").map((finding) => finding.id).sort(), ["ARTIFACT_MISSING:.yolo/gates/bugfix-batch-065.md", "PLAN_REJECTED: missing runtime gate artifact .yolo/gates/bugfix-batch-065.md"]);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("runtime-owned recovery signatures are capped cumulatively across successful recovery loops", async () => {
+  const source = await readFileText(join(process.cwd(), "src/runtime.ts"));
+  assert.match(source, /const attemptsByRuntimeOwnedSignature = new Map<string, number>\(\);/);
+  assert.match(source, /previousRuntimeOwnedAttempts >= attempts/);
+  assert.match(source, /attemptsByRuntimeOwnedSignature\.set\(currentSignature, previousRuntimeOwnedAttempts \+ 1\)/);
+  assert.equal(isRuntimeOwnedRecoverySignature("RUNTIME_GATES_REJECTED|CONTRACT_SCHEMA_MISMATCH"), true);
+  assert.equal(isRuntimeOwnedRecoverySignature("VALIDATOR_REJECTED|BUGFIX_RESULT_INVALID|CONTRACT_SCHEMA_MISMATCH"), true);
+  assert.equal(isRuntimeOwnedRecoverySignature("BUSINESS_LOGIC_DRIFT|CUSTOMER_NOTE_ALLOWLIST_GAP"), false);
+});
+
+test("bugfix recovery signatures ignore positive and advisory validation flags", () => {
+  const noisy = [
+    "ALREADY_IMPLEMENTED_VERIFIED: Phase surfaces were present but progress proof was missing before the fix.",
+    "TENANT_NEUTRALITY_SWEEP_NO_LEAKS: no leakage or missing tenant secrets found",
+    "PRIVACY_MATRIX_NOT_APPLICABLE: privacy gap missing by design",
+    "BUNDLE_DYNAMIC_IMPORT_AUDIT_EVIDENCE_RECORDED: missing bundle proof recorded as N/A",
+    "FUTURE_PHASE_SUCCESS_CRITERIA_RECORDED_AS_MANUAL_NOT_FINDINGS",
+    "CROSS_ORDER_SUPPLIER_BUNDLING_REJECTED: invalid bundling correctly rejected",
+    "RECOVERED_SOURCE_FLAG:BUSINESS_LOGIC_DRIFT",
+    "CUSTOMER_NOTE_ALLOWLIST_GAP",
+    "REGRESSION_PASS",
+    "E2E_PASS",
+    "TENANT_NEUTRALITY_SWEEP_PASS",
+    "FRONTEND_IMPECCABLE_AUDIT_PASS",
+    "AUTH_BOUNDARY_GAP_FIXED",
+    "ROUTE_INVENTORY_MEDIUM_FINDING",
+    "BUSINESS_LOGIC_DRIFT"
+  ];
+  assert.deepEqual(blockingRecoveryFlags(noisy, "BUSINESS_LOGIC_DRIFT").sort(), ["BUSINESS_LOGIC_DRIFT", "CUSTOMER_NOTE_ALLOWLIST_GAP"]);
+  assert.equal(failureSignature(noisy, "BUSINESS_LOGIC_DRIFT"), "BUSINESS_LOGIC_DRIFT|CUSTOMER_NOTE_ALLOWLIST_GAP");
+});
+
+test("gate recovery exhaustion returns explicit terminal stop condition flags", async () => {
+  const flags = ["BUSINESS_LOGIC_DRIFT", "COMMERCIAL_RULE_MISSING:discount-threshold"];
+  const signature = failureSignature(flags, "RUNTIME_GATES_REJECTED");
+  const exhausted = recoveryAttemptsExhausted(16, signature, flags, 2, 2);
+  assert.equal(exhausted.code, "RECOVERY_ATTEMPTS_EXHAUSTED");
+  assert.equal(exhausted.signature, "BUSINESS_LOGIC_DRIFT|COMMERCIAL_RULE_MISSING:discount-threshold|RUNTIME_GATES_REJECTED");
+  assert.deepEqual(exhausted.flags.sort(), ["BUSINESS_LOGIC_DRIFT", "COMMERCIAL_RULE_MISSING:discount-threshold", "RUNTIME_GATES_REJECTED"].sort());
+  assert.equal(exhausted.attemptsPerSignature, 2);
+  const source = await readFileText(join(process.cwd(), "src/runtime.ts"));
+  assert.match(source, /RECOVERY_ATTEMPTS_EXHAUSTED/);
+  assert.match(source, /recoveryAttemptsExhausted\(batch\.number, currentSignature, currentFlags, attempts, totalAttempts\)/);
+  assert.match(source, /RECOVERY_SIGNATURE:\$\{exhausted\.signature\}/);
+});
+
+test("runtime poisoned recovery loop classifies repeated runtime-owned signature after successful bugfix", () => {
+  const flags = ["ARTIFACT_MISSING:.yolo/gates/bugfix-batch-056.md", "CONTRACT_FAILURE"];
+  const signature = failureSignature(flags, "RUNTIME_GATES_REJECTED");
+  const poisoned = runtimePoisonedRecoveryLoop(signature, flags, "RUNTIME_GATES_REJECTED");
+  assert.equal(poisoned?.code, "RUNTIME_POISONED_RECOVERY_LOOP");
+  assert.equal(poisoned?.signature, signature);
+  assert.ok(poisoned?.flags.includes("ARTIFACT_MISSING:.yolo/gates/bugfix-batch-056.md"));
+});
+
+test("poisoned incident capture is limited to poisoned or runtime-owned failures", () => {
+  assert.equal(shouldCapturePoisonedBatchIncidentFixture(["BUSINESS_LOGIC_DRIFT_MARGIN", "CUSTOMER_NOTE_ALLOWLIST_GAP"], "BUSINESS_LOGIC_DRIFT"), false);
+  assert.equal(shouldCapturePoisonedBatchIncidentFixture(["RUNTIME_POISONED_RECOVERY_LOOP", "BUSINESS_LOGIC_DRIFT_MARGIN"], "BUSINESS_LOGIC_DRIFT"), true);
+  assert.equal(shouldCapturePoisonedBatchIncidentFixture(["ARTIFACT_MISSING:.yolo/gates/bugfix-batch-056.md", "CONTRACT_FAILURE"], "RUNTIME_GATES_REJECTED"), true);
+});
+
+test("runtime poisoned recovery loop treats repeated plan rejection as runtime-owned", () => {
+  const flags = ["PLAN_REJECTED: missing runtime gate artifact .yolo/gates/bugfix-batch-065.md"];
+  const signature = failureSignature(flags, "PLAN_REJECTED");
+  const poisoned = runtimePoisonedRecoveryLoop(signature, flags, "PLAN_REJECTED");
+  assert.equal(poisoned?.code, "RUNTIME_POISONED_RECOVERY_LOOP");
+  assert.equal(poisoned?.signature, signature);
+});
+
+test("runtime poisoned recovery loop does not trigger for product source blockers", () => {
+  const flags = ["BUSINESS_LOGIC_DRIFT", "ENTRYPOINT_UNVERIFIED:POST /api/orders"];
+  const signature = failureSignature(flags, "VALIDATOR_REJECTED");
+  assert.equal(runtimePoisonedRecoveryLoop(signature, flags, "VALIDATOR_REJECTED"), null);
+});
+
+test("runtime poisoned recovery loop is primary terminal UX instead of ordinary rejection", async () => {
+  const source = await readFileText(join(process.cwd(), "src/runtime.ts"));
+  assert.match(source, /flags\.includes\("RUNTIME_POISONED_RECOVERY_LOOP"\)/);
+  assert.match(source, /runtimePoisonedRecommendation\(batch\.number/);
+  assert.match(source, /shouldCapturePoisonedBatchIncidentFixture\(flags, result\.failureType\)/);
 });
 
 test("bugfix recovery retries invalid bugfix result contracts before escalation", async () => {
@@ -2460,11 +4206,106 @@ test("runtime does not dispatch bugfix recovery for human security external ops 
   assert.match(source, /requires human\/security approval/);
 });
 
+test("protected coordination modularity findings stop before bugfix recovery", () => {
+  const flags = [
+    "PROTECTED_COORDINATION_FILE_MODULARITY_FINDING",
+    "TOOLING_HUMAN_REQUIRED_SYNC_CONTEXT",
+    "NO_PRODUCTION_SOURCE_REFACTOR"
+  ];
+  assert.equal(hasNonRecoverableRuntimeBlocker(flags), true);
+  assert.deepEqual(blockingRecoveryFlags(flags, "PLAN_REJECTED").sort(), [
+    "PLAN_REJECTED",
+    "PROTECTED_COORDINATION_FILE_MODULARITY_FINDING",
+    "TOOLING_HUMAN_REQUIRED_SYNC_CONTEXT"
+  ]);
+  assert.equal(runtimeOwnedFailureRequiresStop(failureSignature(flags, "PLAN_REJECTED")), true);
+});
+
+test("runtime-owned plan rejection and stale runtime artifacts stop before product bugfix dispatch", async () => {
+  const source = await readFileText(join(process.cwd(), "src/runtime.ts"));
+  assert.match(source, /runtimeOwnedFailureRequiresStop\(nextSignature\)[\s\S]{0,420}return null/);
+  assert.match(source, /runtimeOwnedFailureRequiresStop\(nextSignature\)[\s\S]{0,420}return \{ result: null, flags: blockingRecoveryFlags/);
+  assert.doesNotMatch(source, /runtimeOwnedFailureRequiresStop\(nextSignature\)[\s\S]{0,260}runBugfixAgent/);
+  assert.equal(runtimeOwnedFailureRequiresStop(failureSignature(["PLAN_REJECTED: missing runtime gate artifact .yolo/gates/bugfix-batch-065.md"], "PLAN_REJECTED")), true);
+  assert.equal(runtimeOwnedFailureRequiresStop(failureSignature(["ARTIFACT_MISSING:.yolo/gates/bugfix-batch-065.md"], "RUNTIME_GATES_REJECTED")), true);
+});
+
+test("product source blockers remain bugfix recoverable", () => {
+  const productSignature = failureSignature(["BUSINESS_LOGIC_DRIFT_PAYMENT_AUTH", "ENTRYPOINT_UNVERIFIED:src/routes/payments.ts"], "VALIDATOR_REJECTED");
+  assert.equal(isRuntimeOwnedRecoverySignature(productSignature), false);
+  assert.equal(runtimeOwnedFailureRequiresStop(productSignature), false);
+  assert.equal(hasNonRecoverableRuntimeBlocker(["ARTIFACT_MISSING:src/product-fixture.json"]), false);
+});
+
 test("continue path merges existing successful bugfix results", async () => {
   const source = await readFileText(join(process.cwd(), "src/runtime.ts"));
   assert.match(source, /mergeExistingBugfixResults/);
-  assert.match(source, /batch-\$\{String\(batchNumber\)\.padStart\(3, "0"\)\}-bugfix/);
+  assert.match(source, /canonicalBugfixResultName\(entry, padded\)/);
   assert.match(source, /mergeRecoveredResultFromDisk\(worktree, batchNumber, recovered, bugfix\)/);
+});
+
+test("continue path reconstructs missing implementation result from latest successful bugfix", async () => {
+  const dir = await tempDir();
+  await mkdir(join(dir, ".yolo/batch-results"), { recursive: true });
+  await writeFile(join(dir, ".yolo/batch-results/batch-052-bugfix.json"), JSON.stringify(implementResult({ agent: "bugfix", batch: 52, status: "FAILURE", failureType: "RUNTIME_GATES_REJECTED" })));
+  await writeFile(join(dir, ".yolo/batch-results/batch-052-bugfix-2.json"), JSON.stringify(implementResult({ agent: "bugfix", batch: 52, status: "SUCCESS", filesChanged: ["src/old.ts"] })));
+  await writeFile(join(dir, ".yolo/batch-results/batch-052-bugfix-3.json"), JSON.stringify(implementResult({ agent: "bugfix", batch: 52, status: "SUCCESS", filesChanged: ["src/fixed.ts"], itemsCompleted: ["Fixed resumable batch"] })));
+  const recovered = await readLatestSuccessfulBugfixResult(dir, 52);
+  assert.equal(recovered?.status, "SUCCESS");
+  assert.deepEqual(recovered?.filesChanged, ["src/fixed.ts"]);
+  assert.deepEqual(recovered?.itemsCompleted, ["Fixed resumable batch"]);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("continue path rejects non-canonical bugfix artifact names during missing result reconstruction", async () => {
+  const dir = await tempDir();
+  await mkdir(join(dir, ".yolo/batch-results"), { recursive: true });
+  await writeFile(join(dir, ".yolo/batch-results/batch-052-bugfix-copy.json"), JSON.stringify(implementResult({ agent: "bugfix", batch: 52, status: "SUCCESS", filesChanged: ["src/wrong-name.ts"] })));
+  await writeFile(join(dir, ".yolo/batch-results/batch-052-bugfix-2.json"), JSON.stringify(implementResult({ agent: "bugfix", batch: 52, status: "SUCCESS", filesChanged: ["src/canonical.ts"] })));
+  const recovered = await readLatestSuccessfulBugfixResult(dir, 52);
+  assert.deepEqual(recovered?.filesChanged, ["src/canonical.ts"]);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("continue path rejects wrong-agent bugfix artifacts during missing result reconstruction", async () => {
+  const dir = await tempDir();
+  await mkdir(join(dir, ".yolo/batch-results"), { recursive: true });
+  await writeFile(join(dir, ".yolo/batch-results/batch-052-bugfix-2.json"), JSON.stringify(implementResult({ agent: "implement", batch: 52, status: "SUCCESS", filesChanged: ["src/wrong-agent.ts"] })));
+  await writeFile(join(dir, ".yolo/batch-results/batch-052-bugfix-3.json"), JSON.stringify(implementResult({ agent: "bugfix", batch: 52, status: "SUCCESS", filesChanged: ["src/canonical.ts"] })));
+  const recovered = await readLatestSuccessfulBugfixResult(dir, 52);
+  assert.deepEqual(recovered?.filesChanged, ["src/canonical.ts"]);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("continue path rejects wrong-batch bugfix artifacts during missing result reconstruction", async () => {
+  const dir = await tempDir();
+  await mkdir(join(dir, ".yolo/batch-results"), { recursive: true });
+  await writeFile(join(dir, ".yolo/batch-results/batch-052-bugfix-2.json"), JSON.stringify(implementResult({ agent: "bugfix", batch: 51, status: "SUCCESS", filesChanged: ["src/wrong-batch.ts"] })));
+  await writeFile(join(dir, ".yolo/batch-results/batch-052-bugfix-3.json"), JSON.stringify(implementResult({ agent: "bugfix", batch: 52, status: "SUCCESS", filesChanged: ["src/canonical.ts"] })));
+  const recovered = await readLatestSuccessfulBugfixResult(dir, 52);
+  assert.deepEqual(recovered?.filesChanged, ["src/canonical.ts"]);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("continue path validates claims previous gates missing artifacts and progress item identity", async () => {
+  const source = await readFileText(join(process.cwd(), "src/runtime.ts"));
+  assert.match(source, /verifyPreviousBatchGates\(cwd, batchNumber\)/);
+  assert.match(source, /const claimGate = await prepareRuntimeClaim\(cwd, config, batch\)/);
+  assert.match(source, /readLatestSuccessfulBugfixResult\(worktree, batchNumber\)/);
+  assert.match(source, /MISSING_RESUMABLE_RESULT_ARTIFACT/);
+  assert.match(source, /batchMatchesResultItems\(batch, result\)/);
+  assert.match(source, /RESUME_PROGRESS_ITEM_MISMATCH/);
+  assert.match(source, /result\.status === "INVALID_RESULT"/);
+});
+
+test("continue path resumes existing worktree against persisted batch identity instead of fresh progress selection", async () => {
+  const source = await readFileText(join(process.cwd(), "src/runtime.ts"));
+  assert.match(source, /progressItemsFromPersistedSelection\(state\.selectedItems\)/);
+  assert.match(source, /progressItemsFromPersistedSelection\(result\.itemsCompleted\)/);
+  assert.match(source, /result items do not match persisted batch identity/);
+  assert.match(source, /result\.agent === "bugfix" && result\.batch === batchNumber/);
+  assert.match(source, /canonicalBugfixResultName/);
+  assert.doesNotMatch(source, /result items do not match current progress selection/);
 });
 
 test("continue path refuses only terminal non-recoverable results before gates", async () => {
@@ -2539,6 +4380,23 @@ test("runtime state records support workflow metadata", async () => {
   await rm(dir, { recursive: true, force: true });
 });
 
+test("runtime state and events record version and refresh proof metadata", async () => {
+  const dir = await tempDir();
+  await mkdir(join(dir, ".klevar"), { recursive: true });
+  await writeFile(join(dir, ".klevar/project.json"), JSON.stringify({ templateRuntimeSyncedAt: "2026-06-08T00:00:00.000Z" }));
+  await resetRuntimeState(dir, 2, "full");
+  const state = JSON.parse(await readFile(join(dir, ".yolo/runtime-state.json"), "utf8")) as { runtimeMetadata?: Record<string, string> };
+  assert.equal(state.runtimeMetadata?.runtimeVersion, "0.1.0");
+  assert.equal(state.runtimeMetadata?.stateHygieneRevision, "2026-06-07-trusted-state-hygiene");
+  assert.equal(state.runtimeMetadata?.templateRuntimeSyncedAt, "2026-06-08T00:00:00.000Z");
+  assert.match(state.runtimeMetadata?.runtimeSourceVersion ?? "", /^\d{4}-\d{2}-\d{2}T/);
+  assert.equal(state.runtimeMetadata?.piPackageVersion, "0.1.0");
+  const events = await readFile(join(dir, ".yolo/events/batch-002.jsonl"), "utf8");
+  assert.match(events, /"type":"runtime_version_proof"/);
+  assert.match(events, /"stateHygieneRevision":"2026-06-07-trusted-state-hygiene"/);
+  await rm(dir, { recursive: true, force: true });
+});
+
 test("runtime telemetry records phase checkpoints and preserves inspect scope", async () => {
   const dir = await tempDir();
   await resetRuntimeState(dir, 1, "phase 20");
@@ -2576,18 +4434,20 @@ test("telegram notifications are env-gated and failure-first", () => {
   assert.equal(telegramEnabled(env), true);
   assert.equal(shouldNotifyRuntimeFinish({ cwd: "C:/projects/example-app", status: "failed", batch: 5, phase: "failed", message: "Batch rejected" }, env), true);
   assert.equal(shouldNotifyRuntimeFinish({ cwd: "C:/projects/example-app", status: "complete", batch: 5, phase: "complete", message: "Batch committed" }, env), false);
+  assert.equal(shouldNotifyRuntimeFinish({ cwd: "C:/Users/harri/AppData/Local/Temp/klevar-yolo-test-abc123", status: "failed", batch: 1, phase: "failed", message: "Runtime crashed" }, env), false);
+  assert.equal(shouldNotifyRuntimeFinish({ cwd: "C:/Users/harri/AppData/Local/Temp/klevar-yolo-test-abc123", status: "failed", batch: 1, phase: "failed", message: "Runtime crashed" }, { ...env, KLEVAR_TELEGRAM_NOTIFY_TESTS: "1" }), true);
   assert.match(formatRuntimeNotification({ cwd: "C:/projects/example-app", status: "failed", batch: 5, phase: "failed", message: "Needs input" }), /Batch: 005/);
   assert.equal(telegramEnabled({ ...env, KLEVAR_TELEGRAM_NOTIFY: "0" }), false);
 });
 
-test("runtime heartbeat resets failed status back to running", async () => {
+test("runtime heartbeat does not resurrect failed status", async () => {
   const dir = await tempDir();
   await resetRuntimeState(dir, 1);
   await failRuntimeFromError(dir, new Error("boom"));
   await markHeartbeat(dir, "validate agent running 1m0s");
   const state = JSON.parse(await readFileText(join(dir, ".yolo/runtime-state.json")));
-  assert.equal(state.status, "running");
-  assert.equal(state.phase, "validate");
+  assert.equal(state.status, "failed");
+  assert.equal(state.phase, "failed");
   assert.equal(state.lastEvent, "validate agent running 1m0s");
   await rm(dir, { recursive: true, force: true });
 });
@@ -2601,6 +4461,67 @@ test("runtime phase transitions reset failed status back to running", async () =
   assert.equal(state.status, "running");
   assert.equal(state.phase, "bugfix");
   await rm(dir, { recursive: true, force: true });
+});
+
+test("runtime telemetry records speed v2 journal risk and affected-test observations", async () => {
+  const dir = await tempDir();
+  await resetRuntimeState(dir, 17);
+  await markJournalDecision(dir, 17, "fast_path_used", "eligible simple batch");
+  await markRiskObservation(dir, 17, { class: "low", reasons: ["test"], observedOnly: true });
+  await markAffectedTestPlan(dir, 17, { confidence: "medium", files: ["src/app.ts"], candidateCommands: ["npm test"], rejected: [], observedOnly: true });
+  const state = JSON.parse(await readFileText(join(dir, ".yolo/runtime-state.json"))) as { speed?: { journalDecisions?: unknown[]; riskObservations?: unknown[]; affectedTestPlans?: unknown[] } };
+  assert.equal(state.speed?.journalDecisions?.length, 1);
+  assert.equal(state.speed?.riskObservations?.length, 1);
+  assert.equal(state.speed?.affectedTestPlans?.length, 1);
+  const events = await readFileText(join(dir, ".yolo/events/batch-017.jsonl"));
+  assert.match(events, /"type":"journal_decision"/);
+  assert.match(events, /"type":"risk_observation"/);
+  assert.match(events, /"type":"affected_test_plan"/);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("runtime telemetry records self-healing attempts", async () => {
+  const dir = await tempDir();
+  await resetRuntimeState(dir, 3);
+  await markSelfHeal(dir, "journal", "journal", true, ["retry:batch-003-journal-retry"]);
+  const state = JSON.parse(await readFile(join(dir, ".yolo/runtime-state.json"), "utf8")) as { recovery?: { attempts?: Array<{ phase: string; kind: string; healed: boolean; actions: string[]; at: string }> } };
+  assert.deepEqual(state.recovery?.attempts?.[0], { phase: "journal", kind: "journal", healed: true, actions: ["retry:batch-003-journal-retry"], at: state.recovery?.attempts?.[0].at });
+  assert.match(await readFileText(join(dir, ".yolo/events/batch-003.jsonl")), /"type":"self_heal"/);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("self-healing archives unreadable runtime state before rewrite", async () => {
+  const dir = await tempDir();
+  await mkdir(join(dir, ".yolo"), { recursive: true });
+  await writeFile(join(dir, ".yolo/runtime-state.json"), "{bad json");
+  const actions = await healUnreadableRuntimeState(dir);
+  assert.match(actions[0] ?? "", /^archived:\.yolo\/recovery\/runtime-state\..*\.bad\.json$/);
+  assert.equal(await pathExists(join(dir, ".yolo/runtime-state.json")), false);
+  await resetRuntimeState(dir, 4);
+  const state = JSON.parse(await readFileText(join(dir, ".yolo/runtime-state.json"))) as { status: string; batch: number };
+  assert.equal(state.status, "running");
+  assert.equal(state.batch, 4);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("self-healing refuses safety and human blockers", () => {
+  assert.equal(isSelfHealingSafetyBlocker(["HARDCODED_SECRET_DETECTED"]), true);
+  assert.equal(isSelfHealingSafetyBlocker(["EXTERNAL_MUTATION_NOT_ALLOWED:ssh prod rm file"]), true);
+  assert.equal(isSelfHealingSafetyBlocker(["EXTERNALLY_CLAIMED:docs/progress.md"]), true);
+  assert.equal(isSelfHealingSafetyBlocker(["PROTECTED_PATH_MODIFIED:.agent/rules/CODING_STANDARDS.md"]), true);
+  assert.equal(isSelfHealingSafetyBlocker(["TENANT_ISOLATION_GAP"]), true);
+  assert.equal(isSelfHealingSafetyBlocker(["MERGE_CONFLICT:src/app.ts"]), true);
+  assert.equal(isSelfHealingSafetyBlocker(["JOURNAL_REJECTED"]), false);
+});
+
+test("runtime source wraps only operational self-healing surfaces", async () => {
+  const source = await readFileText(join(process.cwd(), "src/runtime.ts"));
+  assert.match(source, /healUnreadableRuntimeState/);
+  assert.match(source, /markSelfHeal\(rootCwd, "journal", "journal"/);
+  assert.match(source, /markSelfHeal\(cwd, "cleanup", kind, true/);
+  assert.doesNotMatch(source, /withRuntimeSelfHealing[\s\S]*runImplementationAgent/);
+  assert.doesNotMatch(source, /withRuntimeSelfHealing[\s\S]*syncWorktreeChangesToRoot/);
+  assert.doesNotMatch(source, /withRuntimeSelfHealing[\s\S]*createCommit/);
 });
 
 test("runtime crash telemetry marks state failed", async () => {

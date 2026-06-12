@@ -1,4 +1,7 @@
 import type { GateResult } from "./types.js";
+import { flagCode, isPositiveFlag, isWarningFlag } from "./flag-classification.js";
+import { classifyRuntimePath, matchesAnyPolicyPattern } from "./path-policy.js";
+import { defaultConfig } from "./config.js";
 
 export type FindingSeverity = "hard_fail" | "ambiguous" | "warning" | "pass";
 
@@ -10,7 +13,7 @@ export interface GateFinding {
   evidence?: string;
   path?: string;
   command?: string;
-  recommendedAction?: "bugfix" | "adjudicate" | "record";
+  recommendedAction?: "bugfix" | "adjudicate" | "record" | "human";
 }
 
 export interface GateFindingReport {
@@ -26,16 +29,16 @@ export function classifyGateFindings(gates: GateResult[]): GateFindingReport {
       const finding = classifyFlag(gate.name, flag);
       if (finding.severity === "hard_fail") report.hardFailures.push(finding);
       else if (finding.severity === "ambiguous") report.ambiguities.push(finding);
-      else report.warnings.push(finding);
+      else if (finding.severity === "warning") report.warnings.push(finding);
     }
   }
   return report;
 }
 
 function classifyFlag(gate: string, flag: string): GateFinding {
-  const code = flag.split(":")[0] ?? flag;
+  const code = flagCode(flag);
   const severity = severityFor(gate, flag, code);
-  return { gate, code, severity, message: flag, ...detailsFor(flag), recommendedAction: actionFor(gate, code, severity) };
+  return { gate, code, severity, message: flag, ...detailsFor(flag), recommendedAction: actionFor(gate, flag, code, severity) };
 }
 
 function detailsFor(flag: string): Pick<GateFinding, "path" | "command" | "evidence"> {
@@ -47,25 +50,53 @@ function detailsFor(flag: string): Pick<GateFinding, "path" | "command" | "evide
 }
 
 function severityFor(gate: string, flag: string, code: string): FindingSeverity {
-  if (code === "NO_ACTIVE_PROJECT_LOCAL_CHECKS") return "warning";
-  if (code === "IMPECCABLE_DETECTOR_UNAVAILABLE") return "warning";
+  if (isWarningFlag(flag, gate)) return "warning";
+  if (isPositiveFlag(flag)) return "pass";
   if (isFrontendRecoveryCode(code)) return "hard_fail";
   if (code === "INVALID_FLAGS_SHAPE" || code === "INVALID_LOCAL_ONLY_FILES_SHAPE" || code === "INVALID_ARTIFACTS_SHAPE") return "ambiguous";
   if (code === "COMMAND_RERUN_FAILED" && /:e2e:(?:not run|not applicable|skipped|N\/A)\b/i.test(flag)) return "ambiguous";
   if (code === "INVALID_FILES_CHANGED_SHAPE" || code === "INVALID_ITEMS_COMPLETED_SHAPE") return "ambiguous";
-  if (code === "WORKFLOW_INFERRED_VALIDATE_PRD_RUNTIME_PLACEHOLDER_UNAVAILABLE") return "warning";
-  if (code === "PHASE_SCOPE_LIMITED_TO_PHASE_1_CLOSEOUT" || code === "FUTURE_PHASE_SUCCESS_CRITERIA_RECORDED_AS_MANUAL_NOT_FINDINGS") return "warning";
-  if (code === "TENANT_NEUTRALITY_SWEEP_NO_LEAKS") return "warning";
-  if (gate === "business-logic" && code === "BUSINESS_LOGIC_UNTOUCHED_DOCS") return "warning";
   return "hard_fail";
 }
 
-function actionFor(gate: string, code: string, severity: FindingSeverity): GateFinding["recommendedAction"] {
+function actionFor(gate: string, flag: string, code: string, severity: FindingSeverity): GateFinding["recommendedAction"] {
   if (code === "IMPECCABLE_DETECTOR_UNAVAILABLE") return "record";
+  if (isNonRecoverableRuntimeFlag(flag)) return "human";
   if (isFrontendRecoveryCode(code)) return "bugfix";
   if (severity === "hard_fail") return "bugfix";
   if (severity === "ambiguous") return "adjudicate";
   return "record";
+}
+
+export function isNonRecoverableRuntimeFlag(flag: string): boolean {
+  const code = flagCode(flag);
+  if (isNonRecoverableRuntimeCode(code)) return true;
+  if (!isMissingPathEvidenceCode(code)) return false;
+  const path = flagPathPayload(flag);
+  if (!path) return false;
+  const classification = classifyRuntimePath(path);
+  if (!classification.safe || classification.sync === "reject" || classification.sync === "ignore") return true;
+  if (classification.owner === "runtime" || classification.owner === "environment" || classification.owner === "generated") return true;
+  return matchesAnyPolicyPattern(classification.path, [...defaultConfig.policy.protectedPaths, ...defaultConfig.policy.blockedPaths]);
+}
+
+function isMissingPathEvidenceCode(code: string): boolean {
+  return code === "CHANGED_FILE_MISSING" || code === "ARTIFACT_MISSING" || code === "LOCAL_ONLY_FILE_MISSING" || code === "WIRING_VERIFIER_FILE_MISSING";
+}
+
+function flagPathPayload(flag: string): string | null {
+  const index = flag.indexOf(":");
+  if (index < 0) return null;
+  return flag.slice(index + 1).trim().replace(/\\/g, "/");
+}
+
+function isNonRecoverableRuntimeCode(code: string): boolean {
+  return code === "PROTECTED_PATH"
+    || code === "TEMPLATE_MANAGED_PROTECTED_PATH"
+    || code === "BLOCKED_PATH"
+    || code === "UNSAFE_PATH"
+    || code === "PROTECTED_COORDINATION_FILE_MODULARITY_FINDING"
+    || code === "TOOLING_HUMAN_REQUIRED_SYNC_CONTEXT";
 }
 
 function isFrontendRecoveryCode(code: string): boolean {

@@ -10,17 +10,17 @@ import { isAuditItem, isMatrixCoverageAudit, isPhaseCloseout, parseProgress, sel
 import { tickProgressItems } from "./progress-updater.js";
 import { readBatchResult, validateContract, writeBatchResult } from "./result-contracts.js";
 import { runSubagent } from "./subagent-runner.js";
-import { finishRuntime, markTiming, resetRuntimeState, setAgent, setCheckpoint, setGates, setPhase } from "./telemetry.js";
+import { finishRuntime, markAffectedTestPlan, markJournalDecision, markRiskObservation, markSelfHeal, markTiming, resetRuntimeState, setAgent, setCheckpoint, setGates, setPhase } from "./telemetry.js";
 import { adjudicationAccepted, adjudicationAllowed, adjudicationNeedsBugfix, adjudicationNeedsHuman, adjudicationReport, readAdjudicationFile, readExistingAdjudication } from "./adjudication.js";
-import { gatesPassed, validateAll, validateAllWithState } from "./validators/index.js";
+import { gatesPassed, validateAllWithState } from "./validators/index.js";
 import { loadClaims, markRuntimeClaim, prepareRuntimeClaim, validateClaims } from "./collaboration/claims.js";
 import { planParallelBatches } from "./collaboration/scheduler.js";
 import { createWorktree } from "./worktree-manager.js";
 import { pruneSuccessfulWorktrees } from "./worktree-retention.js";
-import { syncLocalOnlyFilesToRoot, syncWorktreeChangesToRoot } from "./worktree-sync.js";
+import { syncLocalOnlyFilesToRoot, syncWorktreeChangesToRoot, validateWorktreeMergeReadiness } from "./worktree-sync.js";
 import { applySupportPlan, makeSupportPlan, markPhaseSupportDue, nextSupportPlan, supportGateStem, type SupportKind, type SupportPlan } from "./support-scheduler.js";
 import { cleanupBatchDockerResources } from "./docker-cleanup.js";
-import { blockingOpenFindings, canonicalizeBatchResultForRuntime, importAgentResultToState, recordGateState, writeRuntimeBatchState } from "./runtime-batch-state.js";
+import { blockingOpenFindings, canonicalizeBatchResultForRuntime, importAgentResultToState, recordGateState, writeRuntimeBatchState, type RuntimeBatchState } from "./runtime-batch-state.js";
 import { validationPolicyFor } from "./validation-policy.js";
 import { acquireRuntimeLock, heartbeatRuntimeLock, releaseRuntimeLock } from "./runtime-lock.js";
 import path from "node:path";
@@ -31,6 +31,13 @@ import { execCommand } from "./util/process.js";
 export { mergeRecoveredResult, mergeRecoveredResultFromDisk } from "./recovery-merge.js";
 import { mergeRecoveredResultFromDisk } from "./recovery-merge.js";
 import type { AgentRole, Batch, BatchResult, GateResult, ProgressItem, RuntimeConfig, YoloScope } from "./types.js";
+import { flagCode, isPositiveFlag, isRuntimeRecoveryMetaFlag, isWarningFlag } from "./flag-classification.js";
+import { isNonRecoverableRuntimeFlag } from "./gate-findings.js";
+import { classifySelfHealError, healUnreadableRuntimeState, isSelfHealingSafetyBlocker } from "./self-healing.js";
+import { writeDeterministicJournal } from "./journal-fast-path.js";
+import { classifyObservedRisk } from "./speed-risk.js";
+import { planAffectedTests } from "./affected-tests.js";
+import { capturePoisonedBatchIncidentFixture } from "./incident-fixtures.js";
 
 export async function runYolo(cwd: string, scope: YoloScope, dryRun: boolean): Promise<void> {
   const lock = dryRun ? null : acquireRuntimeLock(cwd, scopeLabel(scope));
@@ -95,7 +102,9 @@ async function runSingleBatch(cwd: string, config: RuntimeConfig, scope: YoloSco
   await setPhase(cwd, "implement", "Starting implement agent", { worktree: lease.cwd });
   const implStart = Date.now();
   let result = await runImplementationAgent(cwd, lease.cwd, batch, config, context);
-  result = (await importAgentResultToState(lease.cwd, batch, result.agent, result)).currentResult;
+  let batchState = await importAgentResultToState(lease.cwd, batch, result.agent, result);
+  result = batchState.currentResult;
+  await recordSpeedObservations(cwd, batch, result, config);
   await copyBatchResultArtifacts(lease.cwd, cwd, batch, batch.type === "audit" ? "audit" : "implement");
   await markTiming(cwd, "implementMs", Date.now() - implStart);
   await setCheckpoint(cwd, "implement", "passed");
@@ -103,18 +112,33 @@ async function runSingleBatch(cwd: string, config: RuntimeConfig, scope: YoloSco
   const gateStart = Date.now();
   const validation = await validateAllWithState(lease.cwd, batch, result, config, cwd);
   const gates = [claimGate, ...validation.gates];
-  await writeRuntimeBatchState(lease.cwd, recordGateState(validation.state, gates));
+  const gateState = recordGateState(validation.state, gates);
+  await writeRuntimeBatchState(lease.cwd, gateState);
   await markTiming(cwd, "runtimeGatesMs", Date.now() - gateStart);
   await setGates(cwd, gates);
   await writeRuntimeGates(cwd, batch, gates);
   await setCheckpoint(cwd, "runtimeGates", gatesPassed(gates) ? "passed" : "failed");
   await appendJournal(cwd, batch, result, gates);
-  const openFindings = blockingOpenFindings(validation.state);
+  const openFindings = blockingOpenFindings(gateState);
   if (!gatesPassed(gates) && openFindings.length === 0) await writeGate(cwd, "findings", `batch-${String(batch.number).padStart(3, "0")}`, "PASS", batch.number, ["no open blocking canonical findings"]);
   if (gatesPassed(gates) && openFindings.length > 0) {
-    await markRuntimeClaim(cwd, config, batch, "blocked");
-    await handleRejected(cwd, batch, result, openFindings.map((finding) => finding.id), config);
-    return "failed";
+    const recovery = await recoverGateFailure(cwd, lease.cwd, batch, config, context, result, openFindings.map((finding) => finding.id));
+    if (!recovery.result) {
+      await markRuntimeClaim(cwd, config, batch, "blocked");
+      await handleRejected(cwd, batch, result, recovery.flags.length ? recovery.flags : openFindings.map((finding) => finding.id), config);
+      return "failed";
+    }
+    batchState = await importAgentResultToState(lease.cwd, batch, "bugfix", recovery.result);
+    result = batchState.currentResult;
+    const postFindingValidation = await validateAllWithState(lease.cwd, batch, result, config, cwd);
+    await setGates(cwd, postFindingValidation.gates);
+    await writeRuntimeGates(cwd, batch, postFindingValidation.gates);
+    const remainingFindings = blockingOpenFindings(postFindingValidation.state);
+    if (!gatesPassed(postFindingValidation.gates) || remainingFindings.length > 0) {
+      await markRuntimeClaim(cwd, config, batch, "blocked");
+      await handleRejected(cwd, batch, result, remainingFindings.length ? remainingFindings.map((finding) => finding.id) : postFindingValidation.gates.flatMap((gate) => gate.flags), config);
+      return "failed";
+    }
   }
   const adjudication = !gatesPassed(gates) ? await adjudicateIfPossible(cwd, lease.cwd, batch, config, context, result, gates) : "none";
   if (adjudication === "accepted") {
@@ -126,7 +150,8 @@ async function runSingleBatch(cwd: string, config: RuntimeConfig, scope: YoloSco
       await handleRejected(cwd, batch, result, recovery.flags.length ? recovery.flags : gates.flatMap((gate) => gate.flags), config);
       return "failed";
     }
-    result = (await importAgentResultToState(lease.cwd, batch, "bugfix", recovery.result)).currentResult;
+    batchState = await importAgentResultToState(lease.cwd, batch, "bugfix", recovery.result);
+    result = batchState.currentResult;
     await setCheckpoint(cwd, "runtimeGates", "passed");
   }
   const policy = validationPolicyFor(batch, result, config);
@@ -137,17 +162,19 @@ async function runSingleBatch(cwd: string, config: RuntimeConfig, scope: YoloSco
       await markRuntimeClaim(cwd, config, batch, "blocked");
       return "failed";
     }
-    result = (await importAgentResultToState(lease.cwd, batch, "validate", recovered)).currentResult;
+    batchState = await importAgentResultToState(lease.cwd, batch, "validate", recovered);
+    result = batchState.currentResult;
   }
   await setCheckpoint(cwd, "validate", "passed");
-  const journalResult = await runJournalAgent(cwd, lease.cwd, batch, config, context);
+  if (!await runMergeReadinessGate(cwd, lease.cwd, batch, config, batchState, result)) return "failed";
+  const journalResult = await reuseOrRunJournalAgent(cwd, lease.cwd, batch, config, context, batchState, result);
   if (!journalResult) {
     await markRuntimeClaim(cwd, config, batch, "blocked");
     return "failed";
   }
   await setCheckpoint(cwd, "journal", "passed");
   await setPhase(cwd, "merge", "Syncing validated worktree changes back to main project");
-  await syncWorktreeChangesToRoot(lease.cwd, cwd, [...result.filesChanged, ...journalResult.filesChanged]);
+  await syncWorktreeChangesToRoot(lease.cwd, cwd, finalSyncCandidates(batchState, result, journalResult));
   await syncLocalOnlyFilesToRoot(lease.cwd, cwd, result.localOnlyFiles ?? []);
   await tickProgressItems(cwd, batch);
   await markPhaseSupportDue(cwd, batch, await parseProgress(cwd));
@@ -169,7 +196,7 @@ async function runSingleBatch(cwd: string, config: RuntimeConfig, scope: YoloSco
 }
 
 async function continueYolo(cwd: string, config: RuntimeConfig, dryRun: boolean): Promise<void> {
-  const state = await readRuntimeState(cwd);
+  const state = await readRuntimeState(cwd, config);
   const inferred = await findLatestResumableBatch(cwd);
   const stateWorktree = state?.worktree && await exists(String(state.worktree)) ? String(state.worktree) : "";
   const batchNumber = stateWorktree ? Number(state?.batch ?? 0) : Number(inferred?.batch ?? state?.batch ?? 0);
@@ -178,6 +205,12 @@ async function continueYolo(cwd: string, config: RuntimeConfig, dryRun: boolean)
   if (!batchNumber || !worktree || !(await exists(worktree))) {
     await finishRuntime(cwd, "failed", "No resumable YOLO batch found. Start a new batch with next/phase/full.");
     console.log("No resumable YOLO batch found. Start a new batch with next/phase/full.");
+    return;
+  }
+  const missingPreviousGates = await verifyPreviousBatchGates(cwd, batchNumber);
+  if (missingPreviousGates.length) {
+    await finishRuntime(cwd, "failed", `Batch ${batchNumber} cannot continue until previous batch gates are complete: ${missingPreviousGates.join(", ")}`);
+    rejectBatch(batchNumber, ["MISSING_PREVIOUS_BATCH_GATES", ...missingPreviousGates]);
     return;
   }
   if (await completedBatchCommitExists(cwd, batchNumber)) {
@@ -189,9 +222,18 @@ async function continueYolo(cwd: string, config: RuntimeConfig, dryRun: boolean)
   const items = await parseProgress(cwd);
   const support = supportPlanFromRuntimeState(state);
   const selected = support ? [support.item] : selectBatch(items, config.maxBatchSize, `next 1`);
-  const batch: Batch = support ? applySupportPlan({ number: batchNumber, type: "implement", items: selected }, support) : { number: batchNumber, type: classifyBatchType(selected), items: selected };
+  let batch: Batch = support ? applySupportPlan({ number: batchNumber, type: "implement", items: selected }, support) : { number: batchNumber, type: classifyBatchType(selected), items: selected };
+  if (stateWorktree && !batchMatchesStateItems(batch, state) && state?.selectedItems?.length) {
+    batch = { ...batch, items: progressItemsFromPersistedSelection(state.selectedItems) };
+  }
   if (batch.items.length === 0) {
-    console.log("No unchecked progress item found for resumable batch; refusing ambiguous continue.");
+    await finishRuntime(cwd, "failed", "No unchecked progress item found for resumable batch; refusing ambiguous continue.");
+    rejectBatch(batchNumber, ["RESUME_PROGRESS_ITEM_MISSING"]);
+    return;
+  }
+  if (stateWorktree && !batchMatchesStateItems(batch, state)) {
+    await finishRuntime(cwd, "failed", `Batch ${batchNumber} runtime state items do not match current progress selection; refusing ambiguous continue.`);
+    rejectBatch(batchNumber, ["RESUME_PROGRESS_ITEM_MISMATCH"]);
     return;
   }
   console.log(`Continuing batch ${batchNumber} from ${worktree}`);
@@ -201,6 +243,7 @@ async function continueYolo(cwd: string, config: RuntimeConfig, dryRun: boolean)
   const hasResult = await exists(resultFile);
   const context = await buildVisibleBatchContext(cwd, worktree, batch, config);
   let result: BatchResult;
+  let batchState: RuntimeBatchState | undefined;
   if (state?.status === "running" && !hasResult) {
     if (!runningNoResultIsStale(state, config, batch)) {
       console.log(`Batch ${batchNumber} is already running; no ${suffix} result exists yet. Use /yolo-dashboard instead of /klevar-yolo continue until the active agent finishes.`);
@@ -209,14 +252,38 @@ async function continueYolo(cwd: string, config: RuntimeConfig, dryRun: boolean)
     await setPhase(cwd, "implement", `Recovering stale running batch ${batchNumber}; restarting ${suffix} agent in existing worktree`, { batch: batchNumber, worktree, inspect: { ...(state?.inspect ?? {}), requestedScope } });
     const implStart = Date.now();
     result = await runImplementationAgent(cwd, worktree, batch, config, context);
-    result = (await importAgentResultToState(worktree, batch, result.agent, result)).currentResult;
+    batchState = await importAgentResultToState(worktree, batch, result.agent, result);
+    result = batchState.currentResult;
+    await recordSpeedObservations(cwd, batch, result, config);
     await copyBatchResultArtifacts(worktree, cwd, batch, suffix);
     await markTiming(cwd, "implementMs", Date.now() - implStart);
     await setCheckpoint(cwd, "implement", "passed");
   } else {
-    result = await readBatchResult(resultFile);
-    result = await mergeExistingBugfixResults(worktree, batchNumber, result);
-    result = (await importAgentResultToState(worktree, batch, result.agent, result)).currentResult;
+    if (!hasResult) {
+      const recovered = await readLatestSuccessfulBugfixResult(worktree, batchNumber);
+      if (!recovered) {
+        await finishRuntime(cwd, "failed", `Batch ${batchNumber} has no ${suffix} result artifact in existing worktree; clean and rerun.`);
+        rejectBatch(batchNumber, ["MISSING_RESUMABLE_RESULT_ARTIFACT"]);
+        return;
+      }
+      result = recovered;
+    } else {
+      result = await readBatchResult(resultFile);
+      result = await mergeExistingBugfixResults(worktree, batchNumber, result);
+    }
+    await recordSpeedObservations(cwd, batch, result, config);
+    if (!batchMatchesResultItems(batch, result)) {
+      if (stateWorktree && result.itemsCompleted?.length) {
+        batch = { ...batch, items: progressItemsFromPersistedSelection(result.itemsCompleted) };
+      }
+      if (!batchMatchesResultItems(batch, result)) {
+        await finishRuntime(cwd, "failed", `Batch ${batchNumber} result items do not match persisted batch identity; refusing ambiguous continue.`);
+        rejectBatch(batchNumber, ["RESUME_PROGRESS_ITEM_MISMATCH"]);
+        return;
+      }
+    }
+    batchState = await importAgentResultToState(worktree, batch, result.agent, result);
+    result = batchState.currentResult;
     if (isNonResumableResult(result)) {
       const flags = [result.failureType ?? result.status, ...(result.flags ?? [])].filter(Boolean);
       await finishRuntime(cwd, "failed", `Batch ${batchNumber} is not safely resumable; clean and rerun: ${flags.join(", ")}`);
@@ -225,23 +292,43 @@ async function continueYolo(cwd: string, config: RuntimeConfig, dryRun: boolean)
     }
     await copyBatchResultArtifacts(worktree, cwd, batch, suffix);
   }
+  const claimGate = await prepareRuntimeClaim(cwd, config, batch);
+  await writeRuntimeGates(cwd, batch, [claimGate]);
+  if (!claimGate.passed) {
+    await finishRuntime(cwd, "failed", `Batch ${batchNumber} cannot continue due to claim conflicts: ${claimGate.flags.join(", ")}`);
+    rejectBatch(batchNumber, claimGate.flags);
+    return;
+  }
   await setPhase(cwd, "validate", "Continuing from existing worktree result", { batch: batchNumber, worktree, inspect: { ...(state?.inspect ?? {}), requestedScope } });
   const validation = await validateAllWithState(worktree, batch, result, config, cwd);
   const gates = validation.gates;
-  await writeRuntimeBatchState(worktree, recordGateState(validation.state, gates));
+  const gateState = recordGateState(validation.state, gates);
+  await writeRuntimeBatchState(worktree, gateState);
   await setGates(cwd, gates);
   await writeRuntimeGates(cwd, batch, gates);
   await setCheckpoint(cwd, "runtimeGates", gatesPassed(gates) ? "passed" : "failed");
   await appendJournal(cwd, batch, result, gates);
-  const openFindings = blockingOpenFindings(validation.state);
+  const openFindings = blockingOpenFindings(gateState);
   if (!gatesPassed(gates) && openFindings.length === 0) await writeGate(cwd, "findings", `batch-${String(batch.number).padStart(3, "0")}`, "PASS", batch.number, ["no open blocking canonical findings"]);
+  if (gatesPassed(gates) && openFindings.length > 0) {
+    const recovery = await recoverGateFailure(cwd, worktree, batch, config, context, result, openFindings.map((finding) => finding.id));
+    if (!recovery.result) return handleRejected(cwd, batch, result, recovery.flags.length ? recovery.flags : openFindings.map((finding) => finding.id), config);
+    batchState = await importAgentResultToState(worktree, batch, "bugfix", recovery.result);
+    result = batchState.currentResult;
+    const postFindingValidation = await validateAllWithState(worktree, batch, result, config, cwd);
+    await setGates(cwd, postFindingValidation.gates);
+    await writeRuntimeGates(cwd, batch, postFindingValidation.gates);
+    const remainingFindings = blockingOpenFindings(postFindingValidation.state);
+    if (!gatesPassed(postFindingValidation.gates) || remainingFindings.length > 0) return handleRejected(cwd, batch, result, remainingFindings.length ? remainingFindings.map((finding) => finding.id) : postFindingValidation.gates.flatMap((gate) => gate.flags), config);
+  }
   const adjudication = !gatesPassed(gates) ? await adjudicateIfPossible(cwd, worktree, batch, config, context, result, gates) : "none";
   if (adjudication === "accepted") {
     await setCheckpoint(cwd, "runtimeGates", "passed");
   } else if (!gatesPassed(gates)) {
     const recovery = await recoverGateFailure(cwd, worktree, batch, config, context, result, gates.flatMap((gate) => gate.flags));
     if (!recovery.result) return handleRejected(cwd, batch, result, recovery.flags.length ? recovery.flags : gates.flatMap((gate) => gate.flags), config);
-    result = (await importAgentResultToState(worktree, batch, "bugfix", recovery.result)).currentResult;
+    batchState = await importAgentResultToState(worktree, batch, "bugfix", recovery.result);
+    result = batchState.currentResult;
     await setCheckpoint(cwd, "runtimeGates", "passed");
   }
   const policy = validationPolicyFor(batch, result, config);
@@ -249,14 +336,16 @@ async function continueYolo(cwd: string, config: RuntimeConfig, dryRun: boolean)
     await setPhase(cwd, "validate", `Adversarial validation (${policy.mode}/${policy.risk})`, { inspect: { risk: policy.risk, validationMode: policy.mode } });
     const recovered = await validateAdversarial(cwd, worktree, batch, config, context, result);
     if (!recovered) return;
-    result = (await importAgentResultToState(worktree, batch, "validate", recovered)).currentResult;
+    batchState = await importAgentResultToState(worktree, batch, "validate", recovered);
+    result = batchState.currentResult;
   }
   await setCheckpoint(cwd, "validate", "passed");
-  const journalResult = await reuseOrRunJournalAgent(cwd, worktree, batch, config, context);
+  if (!await runMergeReadinessGate(cwd, worktree, batch, config, batchState, result)) return;
+  const journalResult = await reuseOrRunJournalAgent(cwd, worktree, batch, config, context, batchState, result);
   if (!journalResult) return;
   await setCheckpoint(cwd, "journal", "passed");
   await setPhase(cwd, "merge", "Syncing continued worktree changes back to main project");
-  await syncWorktreeChangesToRoot(worktree, cwd, [...result.filesChanged, ...journalResult.filesChanged]);
+  await syncWorktreeChangesToRoot(worktree, cwd, finalSyncCandidates(batchState, result, journalResult));
   await syncLocalOnlyFilesToRoot(worktree, cwd, result.localOnlyFiles ?? []);
   await tickProgressItems(cwd, batch);
   await markPhaseSupportDue(cwd, batch, await parseProgress(cwd));
@@ -281,6 +370,35 @@ async function continueYolo(cwd: string, config: RuntimeConfig, dryRun: boolean)
     console.log(`Continuing original phase YOLO scope after resumed batch: ${target}.`);
     await runYolo(cwd, { mode: "phase", target }, false);
   }
+}
+
+async function recordSpeedObservations(cwd: string, batch: Batch, result: BatchResult, config: RuntimeConfig): Promise<void> {
+  if (config.speed?.observeRisk !== false) await markRiskObservation(cwd, batch.number, classifyObservedRisk({ batch, result }));
+  if (config.speed?.observeAffectedTests !== false) await markAffectedTestPlan(cwd, batch.number, planAffectedTests({ batch, result }));
+}
+
+function finalSyncCandidates(state: RuntimeBatchState | undefined, result: BatchResult, journalResult: BatchResult): string[] {
+  return uniquePaths([...(state?.changedFiles ?? []), ...(result.filesChanged ?? []), ...(journalResult.filesChanged ?? [])]);
+}
+
+function preJournalSyncCandidates(state: RuntimeBatchState | undefined, result: BatchResult): string[] {
+  return uniquePaths([...(state?.changedFiles ?? []), ...(result.filesChanged ?? [])]);
+}
+
+async function runMergeReadinessGate(cwd: string, worktree: string, batch: Batch, config: RuntimeConfig, state: RuntimeBatchState | undefined, result: BatchResult): Promise<boolean> {
+  await setPhase(cwd, "merge", "Checking merge readiness before journal");
+  const gate = await validateWorktreeMergeReadiness(worktree, cwd, preJournalSyncCandidates(state, result));
+  await setGates(cwd, [gate]);
+  await writeRuntimeGates(cwd, batch, [gate]);
+  await setCheckpoint(cwd, "merge", gate.passed ? "passed" : "failed");
+  if (gate.passed) return true;
+  await markRuntimeClaim(cwd, config, batch, "blocked");
+  await handleRejected(cwd, batch, result, gate.flags, config);
+  return false;
+}
+
+function uniquePaths(paths: string[]): string[] {
+  return [...new Set(paths.map((item) => item.replace(/\\/g, "/").trim()).filter(Boolean))];
 }
 
 async function findIncompleteBatch(cwd: string): Promise<number | null> {
@@ -311,9 +429,10 @@ async function listBatchNumbers(cwd: string, relDir: string, pattern: RegExp): P
 
 export async function completedBatchCommitExists(cwd: string, batchNumber: number): Promise<boolean> {
   try {
-    const subjects = await git(cwd, "log -n 50 --format=%s");
     const padded = String(batchNumber).padStart(3, "0");
-    return subjects.split(/\r?\n/).some((subject) => subject.trim() === `feat(yolo): complete batch ${padded}` || subject.trim() === `feat(yolo): complete batch ${batchNumber}`);
+    const patterns = [`feat(yolo): complete batch ${padded}`, `feat(yolo): complete batch ${batchNumber}`];
+    const subjects = await git(cwd, `log --all --fixed-strings --format=%s --grep=${JSON.stringify(patterns[0])} --grep=${JSON.stringify(patterns[1])}`);
+    return subjects.split(/\r?\n/).some((subject) => patterns.includes(subject.trim()));
   } catch {
     return false;
   }
@@ -328,8 +447,11 @@ export async function findLatestResumableBatch(cwd: string): Promise<{ batch: nu
       if (!match) return null;
       const batch = Number(match[1]);
       const worktree = path.join(dir, name);
-      const result = path.join(worktree, `.yolo/batch-results/batch-${String(batch).padStart(3, "0")}-implement.json`);
-      return (await exists(result)) ? { batch, worktree } : null;
+      const padded = String(batch).padStart(3, "0");
+      const implement = path.join(worktree, `.yolo/batch-results/batch-${padded}-implement.json`);
+      const audit = path.join(worktree, `.yolo/batch-results/batch-${padded}-audit.json`);
+      const bugfix = await readLatestSuccessfulBugfixResult(worktree, batch);
+      return (await exists(implement)) || (await exists(audit)) || bugfix ? { batch, worktree } : null;
     }));
     const latest = candidates.filter((item): item is { batch: number; worktree: string } => Boolean(item)).sort((a, b) => b.batch - a.batch)[0] ?? null;
     return latest ? { ...latest, requestedScope: await inferRequestedScope(cwd, latest.batch) } : null;
@@ -360,33 +482,83 @@ function logShowsFullContinuation(text: string, batch: number): boolean {
 }
 
 async function mergeExistingBugfixResults(worktree: string, batchNumber: number, implementation: BatchResult): Promise<BatchResult> {
-  const dir = path.join(worktree, ".yolo/batch-results");
+  const files = await successfulBugfixResultFiles(worktree, batchNumber);
   let recovered = implementation;
-  try {
-    const prefix = `batch-${String(batchNumber).padStart(3, "0")}-bugfix`;
-    const files = (await readdir(dir)).filter((file) => file.startsWith(prefix) && file.endsWith(".json")).sort();
-    for (const file of files) {
-      const bugfix = await readBatchResult(path.join(dir, file));
-      if (bugfix.status === "SUCCESS") recovered = await mergeRecoveredResultFromDisk(worktree, batchNumber, recovered, bugfix);
-    }
-  } catch {
-    return recovered;
+  for (const file of files) {
+    const bugfix = await readBatchResult(file);
+    recovered = await mergeRecoveredResultFromDisk(worktree, batchNumber, recovered, bugfix);
   }
   return recovered;
 }
 
+export async function readLatestSuccessfulBugfixResult(worktree: string, batchNumber: number): Promise<BatchResult | null> {
+  const files = await successfulBugfixResultFiles(worktree, batchNumber);
+  const latest = files.at(-1);
+  return latest ? readBatchResult(latest) : null;
+}
+
+async function successfulBugfixResultFiles(worktree: string, batchNumber: number): Promise<string[]> {
+  const dir = path.join(worktree, ".yolo/batch-results");
+  try {
+    const padded = String(batchNumber).padStart(3, "0");
+    const files: string[] = [];
+    for (const file of (await readdir(dir)).filter((entry) => canonicalBugfixResultName(entry, padded)).sort((a, b) => bugfixJsonOrder(a) - bugfixJsonOrder(b) || a.localeCompare(b))) {
+      const result = await readBatchResult(path.join(dir, file));
+      if (result.status === "SUCCESS" && result.agent === "bugfix" && result.batch === batchNumber) files.push(path.join(dir, file));
+    }
+    return files;
+  } catch {
+    return [];
+  }
+}
+
+function canonicalBugfixResultName(file: string, paddedBatch: string): boolean {
+  return new RegExp(`^batch-${paddedBatch}-bugfix(?:-(\\d+))?\\.json$`).test(file);
+}
+
+function bugfixJsonOrder(file: string): number {
+  const match = /-bugfix(?:-(\d+))?\.json$/.exec(file);
+  return match?.[1] ? Number(match[1]) : 1;
+}
+
 function isNonResumableResult(result: BatchResult): boolean {
-  return result.failureType === "AUDIT_PREMATURE" || result.status === "BUG_FOUND";
+  return result.failureType === "AUDIT_PREMATURE" || result.status === "BUG_FOUND" || result.status === "INVALID_RESULT";
+}
+
+function batchMatchesResultItems(batch: Batch, result: BatchResult): boolean {
+  if (!result.itemsCompleted?.length) return false;
+  const completed = result.itemsCompleted.join("\n").toLowerCase();
+  return batch.items.every((item) => completed.includes(item.title.toLowerCase()) || Boolean(item.raw && completed.includes(item.raw.toLowerCase())));
+}
+
+function batchMatchesStateItems(batch: Batch, state: { selectedItems?: string[] } | null): boolean {
+  const selected = state?.selectedItems ?? [];
+  if (!selected.length) return true;
+  const expected = selected.join("\n").toLowerCase();
+  return batch.items.every((item) => expected.includes(item.title.toLowerCase()) || Boolean(item.raw && expected.includes(item.raw.toLowerCase())));
+}
+
+function progressItemsFromPersistedSelection(selectedItems: string[]): ProgressItem[] {
+  return selectedItems.map((value) => {
+    const raw = String(value);
+    const title = raw.replace(/^\s*-\s*\[[ xX]\]\s*/, "").trim() || raw.trim() || "Persisted resumed batch item";
+    return { raw, title, tag: "RESUME", phase: "resumed", checked: false };
+  });
 }
 
 function scopeLabel(scope: YoloScope): string {
   return scope.mode === "full" ? "full" : scope.mode === "count" ? `next ${scope.target}` : scope.mode === "phase" ? `phase ${scope.target}` : scope.mode;
 }
 
-async function readRuntimeState(cwd: string): Promise<{ status?: string; batch?: number; worktree?: string; inspect?: Record<string, string>; updatedAt?: string } | null> {
+async function readRuntimeState(cwd: string, config?: RuntimeConfig): Promise<{ status?: string; batch?: number; worktree?: string; inspect?: Record<string, string>; updatedAt?: string; selectedItems?: string[] } | null> {
+  const file = path.join(cwd, ".yolo/runtime-state.json");
   try {
-    return JSON.parse(await readFile(path.join(cwd, ".yolo/runtime-state.json"), "utf8")) as { status?: string; batch?: number; worktree?: string; inspect?: Record<string, string>; updatedAt?: string };
-  } catch {
+    return JSON.parse(await readFile(file, "utf8")) as { status?: string; batch?: number; worktree?: string; inspect?: Record<string, string>; updatedAt?: string; selectedItems?: string[] };
+  } catch (error) {
+    if (config?.recovery?.selfHealRuntime && config.recovery.repairUnreadableRuntimeState && classifySelfHealError(error) === "runtime-state") {
+      const actions = await healUnreadableRuntimeState(cwd).catch(() => []);
+      if (actions.length) await markSelfHeal(cwd, "resume", "runtime-state", true, actions);
+    }
     return null;
   }
 }
@@ -444,15 +616,19 @@ async function runParallelYolo(cwd: string, config: RuntimeConfig, scope: Extrac
   await markTiming(cwd, "implementMs", Date.now() - implStart);
   await setPhase(cwd, "validate", "Running runtime gates for parallel shards");
   const allGates = [];
+  const openFindingFlags: string[] = [];
   for (let index = 0; index < plan.shards.length; index += 1) {
-    const gates = await validateAll(leases[index].cwd, plan.shards[index], results[index], config, cwd);
+    const validation = await validateAllWithState(leases[index].cwd, plan.shards[index], results[index], config, cwd);
+    const gates = validation.gates;
     const shard = `p${String(index + 1).padStart(2, "0")}`;
+    const openFindings = blockingOpenFindings(validation.state);
+    if (openFindings.length) openFindingFlags.push(...openFindings.map((finding) => `PARALLEL_${shard}_OPEN_FINDING:${finding.id}`));
     allGates.push(...gates.map((gate) => ({ ...gate, name: `${gate.name}-${shard}` })));
     for (const gate of gates) await writeGate(cwd, gate.name, `batch-${String(batchNumber).padStart(3, "0")}-${shard}`, gate.passed ? "PASS" : "FAIL", batchNumber, gate.flags);
   }
   const failed = allGates.filter((gate) => !gate.passed);
   await setGates(cwd, [claimGate, ...allGates]);
-  if (failed.length) return handleRejected(cwd, { number: batchNumber, type: "implement", items: plan.shards.flatMap((shard) => shard.items) }, results[0], failed.flatMap((gate) => gate.flags), config);
+  if (failed.length || openFindingFlags.length) return handleRejected(cwd, { number: batchNumber, type: "implement", items: plan.shards.flatMap((shard) => shard.items) }, results[0], failed.length ? failed.flatMap((gate) => gate.flags) : openFindingFlags, config);
   await setPhase(cwd, "merge", "Syncing validated parallel shard changes back to main project");
   const conflicts = detectResultFileConflicts(results);
   if (conflicts.length) {
@@ -561,17 +737,40 @@ async function validateAdversarial(rootCwd: string, cwd: string, batch: Batch, c
   let totalAttempts = 0;
   let currentSignature = failureSignature(currentFlags, currentValidation.failureType);
   let attemptForSignature = 0;
+  const attemptsByRuntimeOwnedSignature = new Map<string, number>();
   while (totalAttempts < maxTotalAttempts) {
+    if (hasNonRecoverableRuntimeBlocker(currentFlags)) {
+      await finishRuntime(rootCwd, "failed", `Batch ${batch.number} has non-recoverable runtime safety blockers: ${currentFlags.join(", ")}`);
+      rejectBatch(batch.number, currentFlags);
+      return null;
+    }
     const nextSignature = failureSignature(currentFlags, currentValidation.failureType);
+    if (runtimeOwnedFailureRequiresStop(nextSignature)) {
+      await finishRuntime(rootCwd, "failed", runtimeOwnedFailureRecommendation(batch.number, nextSignature));
+      rejectBatch(batch.number, blockingRecoveryFlags(currentFlags, currentValidation.failureType));
+      return null;
+    }
     if (nextSignature !== currentSignature) {
       currentSignature = nextSignature;
       attemptForSignature = 0;
     }
-    if (attemptForSignature >= attempts) break;
+    const runtimeOwnedSignature = isRuntimeOwnedRecoverySignature(currentSignature);
+    const previousRuntimeOwnedAttempts = attemptsByRuntimeOwnedSignature.get(currentSignature) ?? 0;
+    if (attemptForSignature >= attempts || (runtimeOwnedSignature && previousRuntimeOwnedAttempts >= attempts)) {
+      const poisoned = runtimePoisonedRecoveryLoop(currentSignature, currentFlags, currentValidation.failureType);
+      if (poisoned) {
+        await finishRuntime(rootCwd, "failed", runtimePoisonedRecommendation(batch.number, poisoned));
+        rejectBatch(batch.number, [poisoned.code, ...poisoned.flags]);
+        return null;
+      }
+      break;
+    }
     attemptForSignature += 1;
     totalAttempts += 1;
+    if (runtimeOwnedSignature) attemptsByRuntimeOwnedSignature.set(currentSignature, previousRuntimeOwnedAttempts + 1);
+    const recoveryFlags = blockingRecoveryFlags(currentFlags, currentValidation.failureType);
     await setPhase(rootCwd, "bugfix", `Validation rejected batch ${batch.number}; dispatching bugfix recovery attempt ${attemptForSignature}/${attempts} for ${currentSignature}`);
-    const bugfix = await runBugfixAgent(rootCwd, cwd, batch, config, context, currentValidation, currentFlags, totalAttempts);
+    const bugfix = await runBugfixAgent(rootCwd, cwd, batch, config, context, currentValidation, recoveryFlags, totalAttempts);
     const bugfixGate = validateContract(bugfix);
     if (!bugfixGate.passed || bugfix.status !== "SUCCESS") {
       currentFlags = [...bugfixGate.flags, ...(bugfix.flags ?? []), bugfix.failureType ?? "BUGFIX_RECOVERY_FAILED"];
@@ -602,6 +801,12 @@ async function validateAdversarial(rootCwd: string, cwd: string, batch: Batch, c
       || validationFailureContradictedByRecoveredEvidence(currentValidation, recovered, bugfix)
     )) return recovered;
     currentFlags = [...secondGate.flags, ...(currentValidation.flags ?? []), currentValidation.failureType ?? "VALIDATOR_REJECTED_AFTER_BUGFIX"];
+    const poisoned = runtimePoisonedRecoveryLoop(currentSignature, currentFlags, currentValidation.failureType);
+    if (poisoned) {
+      await finishRuntime(rootCwd, "failed", runtimePoisonedRecommendation(batch.number, poisoned));
+      rejectBatch(batch.number, [poisoned.code, ...currentFlags]);
+      return null;
+    }
   }
   await finishRuntime(rootCwd, "failed", `Adversarial validation rejected recovered batch ${batch.number}: ${currentFlags.join(", ")}`);
   rejectBatch(batch.number, currentFlags);
@@ -629,14 +834,24 @@ function recoveredEvidenceContradictsFlag(flag: string, recovered: BatchResult, 
     const entrypoint = flag.slice("ENTRYPOINT_UNVERIFIED:".length);
     return hasWiringEntrypointEvidence(recovered, entrypoint) || hasWiringEntrypointEvidence(bugfix, entrypoint);
   }
-  if (/UNWIRED|DRIFT|NOT_PROPAGATED|MISSING/i.test(flag)) {
-    return hasPassingValidationEvidence(bugfix) && (bugfix.flags ?? []).some((fixedFlag) => /WIRED|PROPAGATED|FIXED|PASS/i.test(fixedFlag));
+  if (/UNWIRED|DRIFT|NOT_PROPAGATED|MISSING|GAP/i.test(flag)) {
+    if (/BUSINESS_LOGIC_DRIFT|AUTHORITY|ALLOWLIST|PAYMENT|TENANT|SECURITY|SECRET|COMMERCIAL|PRICING|BILLING/i.test(flag)) return hasExplicitRelatedFixFlag(flag, bugfix);
+    return hasPassingValidationEvidence(bugfix) && (bugfix.flags ?? []).some((fixedFlag) => /WIRED|PROPAGATED|FIXED|PASS|RECOVERED|COVERED|VERIFIED/i.test(fixedFlag));
   }
   return false;
 }
 
+function hasExplicitRelatedFixFlag(flag: string, bugfix: BatchResult): boolean {
+  const blocker = evidenceKey(flag.replace(/^RESULT_STATUS_FAILURE:/, ""));
+  return (bugfix.flags ?? []).some((fixedFlag) => {
+    if (!isPositiveValidationFlag(fixedFlag)) return false;
+    const fixed = evidenceKey(fixedFlag.replace(/(?:FIXED|PASS|PASSED|WIRED|PROPAGATED|SATISFIED|COVERED|ENFORCED|RECOVERED|VERIFIED)$/i, ""));
+    return Boolean(fixed && blocker && (blocker.includes(fixed) || fixed.includes(blocker)));
+  });
+}
+
 function isPositiveValidationFlag(flag: string): boolean {
-  return /(?:_PASS|_PASSED|_FIXED|_WIRED|_PROPAGATED|_SATISFIED|_COVERED|_ENFORCED)$/i.test(flag);
+  return isPositiveFlag(flag);
 }
 
 function hasPassingRunnableE2e(result: BatchResult): boolean {
@@ -664,8 +879,8 @@ function isRunnableValidationCommand(command: string | undefined): command is st
 }
 
 async function recoverGateFailure(rootCwd: string, cwd: string, batch: Batch, config: RuntimeConfig, context: string, implementation: BatchResult, flags: string[]): Promise<{ result: BatchResult | null; flags: string[] }> {
-  if (requiresHumanSecurityApproval(flags)) {
-    await finishRuntime(rootCwd, "failed", `Batch ${batch.number} requires human/security approval: ${flags.join(", ")}`);
+  if (requiresHumanSecurityApproval(flags) || hasNonRecoverableRuntimeBlocker(flags)) {
+    await finishRuntime(rootCwd, "failed", `Batch ${batch.number} requires human/security approval or tooling intervention: ${flags.join(", ")}`);
     return { result: null, flags };
   }
   let recovered = implementation;
@@ -675,18 +890,31 @@ async function recoverGateFailure(rootCwd: string, cwd: string, batch: Batch, co
   let totalAttempts = 0;
   let currentSignature = failureSignature(currentFlags, "RUNTIME_GATES_REJECTED");
   let attemptForSignature = 0;
+  const attemptsByRuntimeOwnedSignature = new Map<string, number>();
   while (totalAttempts < maxTotalAttempts) {
     const nextSignature = failureSignature(currentFlags, "RUNTIME_GATES_REJECTED");
+    if (runtimeOwnedFailureRequiresStop(nextSignature)) {
+      await finishRuntime(rootCwd, "failed", runtimeOwnedFailureRecommendation(batch.number, nextSignature));
+      return { result: null, flags: blockingRecoveryFlags(currentFlags, "RUNTIME_GATES_REJECTED") };
+    }
     if (nextSignature !== currentSignature) {
       currentSignature = nextSignature;
       attemptForSignature = 0;
     }
-    if (attemptForSignature >= attempts) break;
+    const runtimeOwnedSignature = isRuntimeOwnedRecoverySignature(currentSignature);
+    const previousRuntimeOwnedAttempts = attemptsByRuntimeOwnedSignature.get(currentSignature) ?? 0;
+    if (attemptForSignature >= attempts || (runtimeOwnedSignature && previousRuntimeOwnedAttempts >= attempts)) {
+      const poisoned = runtimePoisonedRecoveryLoop(currentSignature, currentFlags, "RUNTIME_GATES_REJECTED");
+      if (poisoned) return { result: null, flags: [poisoned.code, ...poisoned.flags] };
+      break;
+    }
     attemptForSignature += 1;
     totalAttempts += 1;
+    if (runtimeOwnedSignature) attemptsByRuntimeOwnedSignature.set(currentSignature, previousRuntimeOwnedAttempts + 1);
+    const recoveryFlags = blockingRecoveryFlags(currentFlags, "RUNTIME_GATES_REJECTED");
     await setPhase(rootCwd, "bugfix", `Runtime gates rejected batch ${batch.number}; dispatching bugfix recovery attempt ${attemptForSignature}/${attempts} for ${currentSignature}`);
-    const pseudoValidation: BatchResult = { ...implementation, status: "FAILURE", failureType: "RUNTIME_GATES_REJECTED", flags: currentFlags };
-    const bugfix = await runBugfixAgent(rootCwd, cwd, batch, config, context, pseudoValidation, currentFlags, totalAttempts);
+    const pseudoValidation: BatchResult = { ...implementation, status: "FAILURE", failureType: "RUNTIME_GATES_REJECTED", flags: recoveryFlags };
+    const bugfix = await runBugfixAgent(rootCwd, cwd, batch, config, context, pseudoValidation, recoveryFlags, totalAttempts);
     const bugfixGate = validateContract(bugfix);
     if (!bugfixGate.passed || bugfix.status !== "SUCCESS") {
       currentFlags = [...bugfixGate.flags, ...(bugfix.flags ?? []), bugfix.failureType ?? "BUGFIX_RECOVERY_FAILED"];
@@ -699,26 +927,125 @@ async function recoverGateFailure(rootCwd: string, cwd: string, batch: Batch, co
     const gates = validation.gates;
     await setGates(rootCwd, gates);
     await writeRuntimeGates(rootCwd, batch, gates);
-    if (gatesPassed(gates)) return { result: recovered, flags: [] };
-    const adjudication = await adjudicateIfPossible(rootCwd, cwd, batch, config, context, recovered, gates);
+    const openFindings = blockingOpenFindings(validation.state);
+    if (gatesPassed(gates) && openFindings.length === 0) return { result: recovered, flags: [] };
+    const adjudication = !gatesPassed(gates) ? await adjudicateIfPossible(rootCwd, cwd, batch, config, context, recovered, gates) : "none";
     if (adjudication === "accepted") return { result: recovered, flags: [] };
-    currentFlags = gates.flatMap((gate) => gate.flags);
+    currentFlags = gatesPassed(gates) && openFindings.length > 0 ? openFindings.map((finding) => finding.id) : gates.flatMap((gate) => gate.flags);
+    const poisoned = runtimePoisonedRecoveryLoop(currentSignature, currentFlags, "RUNTIME_GATES_REJECTED");
+    if (poisoned) {
+      await finishRuntime(rootCwd, "failed", runtimePoisonedRecommendation(batch.number, poisoned));
+      return { result: null, flags: [poisoned.code, ...currentFlags] };
+    }
     if (adjudication === "human") return { result: null, flags: currentFlags };
   }
-  return { result: null, flags: currentFlags };
+  const exhausted = recoveryAttemptsExhausted(batch.number, currentSignature, currentFlags, attempts, totalAttempts);
+  await finishRuntime(rootCwd, "failed", recoveryAttemptsExhaustedRecommendation(exhausted));
+  return { result: null, flags: [exhausted.code, `RECOVERY_SIGNATURE:${exhausted.signature}`, `RECOVERY_ATTEMPTS:${exhausted.attemptsPerSignature}/${exhausted.maxAttemptsPerSignature}`, `RECOVERY_TOTAL_ATTEMPTS:${exhausted.totalAttempts}`, ...exhausted.flags] };
 }
 
-function failureSignature(flags: string[], failureType?: string | null): string {
-  const normalized = [failureType ?? "UNKNOWN_FAILURE", ...flags]
-    .filter(Boolean)
-    .map((flag) => flag.replace(/^RECOVERED_SOURCE_FLAG:/, ""))
-    .filter((flag) => !/_PASS$/.test(flag) && !flag.endsWith("_FIXED"))
-    .sort();
+export interface RecoveryAttemptsExhausted {
+  code: "RECOVERY_ATTEMPTS_EXHAUSTED";
+  batchNumber: number;
+  signature: string;
+  flags: string[];
+  attemptsPerSignature: number;
+  maxAttemptsPerSignature: number;
+  totalAttempts: number;
+}
+
+export function recoveryAttemptsExhausted(batchNumber: number, signature: string, flags: string[], maxAttemptsPerSignature: number, totalAttempts: number): RecoveryAttemptsExhausted {
+  return {
+    code: "RECOVERY_ATTEMPTS_EXHAUSTED",
+    batchNumber,
+    signature,
+    flags: blockingRecoveryFlags(flags, "RUNTIME_GATES_REJECTED"),
+    attemptsPerSignature: maxAttemptsPerSignature,
+    maxAttemptsPerSignature,
+    totalAttempts
+  };
+}
+
+function recoveryAttemptsExhaustedRecommendation(exhausted: RecoveryAttemptsExhausted): string {
+  return `RECOVERY_ATTEMPTS_EXHAUSTED: Batch ${exhausted.batchNumber} exhausted bugfix recovery budget for blocker signature ${exhausted.signature} after ${exhausted.attemptsPerSignature}/${exhausted.maxAttemptsPerSignature} attempts for that signature (${exhausted.totalAttempts} total). Resolve the blocker or increase recovery.maxBugfixAttempts intentionally; do not treat this as an ordinary recoverable continue.`;
+}
+
+export interface RuntimePoisonedRecoveryLoop {
+  code: "RUNTIME_POISONED_RECOVERY_LOOP";
+  signature: string;
+  flags: string[];
+}
+
+export function runtimePoisonedRecoveryLoop(previousSignature: string, flags: string[], failureType?: string | null): RuntimePoisonedRecoveryLoop | null {
+  const signature = failureSignature(flags, failureType);
+  if (signature !== previousSignature) return null;
+  const blocking = blockingRecoveryFlags(flags, failureType);
+  if (blocking.length === 0) return null;
+  if (!blocking.every(isRuntimeOwnedRecoveryFlag)) return null;
+  return { code: "RUNTIME_POISONED_RECOVERY_LOOP", signature, flags: blocking };
+}
+
+function runtimePoisonedRecommendation(batchNumber: number, poisoned: RuntimePoisonedRecoveryLoop): string {
+  return `RUNTIME_POISONED_RECOVERY_LOOP: Batch ${batchNumber} repeated runtime/support/tooling blocker signature after a successful bugfix (${poisoned.signature}). Preserve an incident fixture, then clean the failed batch and restart YOLO; do not spend more bugfix attempts on this runtime-owned state.`;
+}
+
+function runtimeOwnedFailureRecommendation(batchNumber: number, signature: string): string {
+  return `RUNTIME_OWNED_FAILURE_STOP: Batch ${batchNumber} hit runtime/tooling/support-owned blocker signature before product bugfix dispatch (${signature}). Preserve incident evidence if state looks poisoned, refresh/fix the runtime, then restart instead of patching product code.`;
+}
+
+export function runtimeOwnedFailureRequiresStop(signature: string): boolean {
+  return isRuntimeOwnedRecoverySignature(signature);
+}
+
+export function failureSignature(flags: string[], failureType?: string | null): string {
+  const normalized = blockingRecoveryFlags(flags, failureType).sort();
   return normalized.join("|") || "UNKNOWN_FAILURE";
+}
+
+export function isRuntimeOwnedRecoverySignature(signature: string): boolean {
+  const flags = signature.split("|").map((flag) => flag.trim()).filter(Boolean);
+  if (flags.length === 0) return false;
+  return flags.every((flag) => isRuntimeOwnedRecoveryFlag(flag));
+}
+
+export function blockingRecoveryFlags(flags: string[], failureType?: string | null): string[] {
+  const normalized = new Set<string>();
+  for (const flag of [failureType ?? "UNKNOWN_FAILURE", ...flags]) {
+    const cleaned = normalizeRecoveryFlag(flag);
+    if (cleaned) normalized.add(cleaned);
+  }
+  return [...normalized];
+}
+
+function normalizeRecoveryFlag(flag: string | null | undefined): string | null {
+  const value = flag?.replace(/^RECOVERED_SOURCE_FLAG:/, "").trim();
+  if (!value) return null;
+  if (isRuntimeRecoveryMetaFlag(value)) return null;
+  if (isPositiveValidationFlag(value) || isWarningFlag(value)) return null;
+  if (/_(?:LOW|MEDIUM)_FINDING$/i.test(value)) return null;
+  return value;
+}
+
+function isRuntimeOwnedRecoveryFlag(flag: string): boolean {
+  const code = flagCode(flag);
+  if (isNonRecoverableRuntimeFlag(flag)) return true;
+  if (/^(?:VALIDATOR_REJECTED|PLAN_REJECTED|RUNTIME|BUGFIX|CONTRACT|RESULT_STATUS|GATE|JOURNAL|AGENT|WORKTREE|COMMAND_RERUN|ADJUDICATION)(?:_|$)/i.test(code)) return true;
+  if (/^(?:MISSING_|INVALID_).*?(?:ARTIFACT|MANIFEST|RESULT|GATE|JOURNAL|REPORT|SHAPE)/i.test(code)) return true;
+  if (/^(?:ARTIFACT|CHANGED_FILE|LOCAL_ONLY_FILE|WIRING_VERIFIER_FILE)_(?:MISSING|MISSING_METADATA)$/i.test(code)) {
+    const path = flag.includes(":") ? flag.slice(flag.indexOf(":") + 1).replace(/\\/g, "/") : "";
+    return path.startsWith(".yolo/") || path.startsWith(".pi/") || path.startsWith(".agent/") || path === "AGENTS.md" || path === "CLAUDE.md" || path === "docs/progress.md";
+  }
+  if (/^(?:TEMPLATE_MANAGED_PROTECTED_PATH|PROTECTED_PATH|RUNTIME_ONLY_PATH|SUPPORT_LOOP_STALE)$/i.test(code)) return true;
+  if (/^(?:MODULARITY_RULE_FILE_LIMIT_VIOLATION|FUTURE_PHASE_SUCCESS_CRITERIA_RECORDED_AS_MANUAL_NOT_FINDINGS|WORKFLOW_INFERRED_VALIDATE_PRD_RUNTIME_PLACEHOLDER_UNAVAILABLE)$/i.test(code)) return true;
+  return false;
 }
 
 function requiresHumanSecurityApproval(flags: string[]): boolean {
   return flags.some((flag) => flag.startsWith("EXTERNAL_MUTATION_NOT_ALLOWED:") || flag.startsWith("EXTERNAL_MUTATION_COMMAND_NOT_ALLOWED:") || flag.startsWith("EXTERNAL_MUTATION_EVIDENCE_NOT_ALLOWED:"));
+}
+
+export function hasNonRecoverableRuntimeBlocker(flags: string[]): boolean {
+  return flags.some(isNonRecoverableRuntimeFlag);
 }
 
 export async function canonicalizeBatchResultManifests(cwd: string, batchNumber: number): Promise<string[]> {
@@ -803,22 +1130,40 @@ function resultFlags(result: BatchResult): string[] {
   return Array.isArray(result.flags) ? result.flags : result.flags === undefined ? [] : ["INVALID_FLAGS_SHAPE"];
 }
 
-async function reuseOrRunJournalAgent(rootCwd: string, cwd: string, batch: Batch, config: RuntimeConfig, context: string): Promise<BatchResult | null> {
+async function reuseOrRunJournalAgent(rootCwd: string, cwd: string, batch: Batch, config: RuntimeConfig, context: string, state?: RuntimeBatchState, result?: BatchResult): Promise<BatchResult | null> {
   const existing = await readExistingJournalResult(cwd, batch);
   if (existing) {
     await setPhase(rootCwd, "journal", "Reusing existing valid journal artifacts");
+    await markJournalDecision(rootCwd, batch.number, "reused_existing", "valid journal artifacts already exist");
     await writeGate(cwd, "journal", `batch-${String(batch.number).padStart(3, "0")}`, "PASS", batch.number);
     await setGates(rootCwd, [{ name: "journal", passed: true, flags: [] }]);
     return existing;
+  }
+  if (result) {
+    const deterministic = await writeDeterministicJournal({ cwd, batch, result, config, runtimeState: state }).catch(async (error) => {
+      await markJournalDecision(rootCwd, batch.number, "fallback", error instanceof Error ? error.message : String(error));
+      return null;
+    });
+    if (deterministic) {
+      await setPhase(rootCwd, "journal", "Writing deterministic build journal fast path");
+      await markJournalDecision(rootCwd, batch.number, "fast_path_used", "eligible simple validated batch");
+      await setGates(rootCwd, [{ name: "journal", passed: true, flags: [] }]);
+      return deterministic;
+    }
+    await markJournalDecision(rootCwd, batch.number, "fallback", "deterministic journal not eligible or contract failed");
   }
   return runJournalAgent(rootCwd, cwd, batch, config, context);
 }
 
 async function readExistingJournalResult(cwd: string, batch: Batch): Promise<BatchResult | null> {
-  const id = `batch-${String(batch.number).padStart(3, "0")}-journal`;
-  const result = await readBatchResult(path.join(cwd, `.yolo/batch-results/${id}.json`));
-  const contract = validateJournalContract(result);
-  return contract.passed && result.status === "SUCCESS" ? result : null;
+  const padded = String(batch.number).padStart(3, "0");
+  const candidates = [`batch-${padded}-journal-retry.json`, `batch-${padded}-journal.json`];
+  for (const file of candidates) {
+    const result = await readBatchResult(path.join(cwd, `.yolo/batch-results/${file}`));
+    const contract = validateJournalContract(result);
+    if (contract.passed && result.status === "SUCCESS") return result;
+  }
+  return null;
 }
 
 export async function journalSource(cwd: string, batch: Batch): Promise<{ file: string; type: string }> {
@@ -845,14 +1190,24 @@ async function journalSourceCandidates(dir: string, padded: string, batchType: B
 
 async function latestBugfixJournalSources(dir: string, padded: string): Promise<Array<{ file: string; type: string }>> {
   try {
-    return (await readdir(dir))
-      .filter((file) => file.startsWith(`batch-${padded}-bugfix`) && file.endsWith(".md"))
-      .sort()
-      .reverse()
-      .map((file) => ({ file: `.yolo/batch-results/${file}`, type: "bugfix" }));
+    const candidates: Array<{ file: string; order: number }> = [];
+    for (const file of await readdir(dir)) {
+      if (!file.startsWith(`batch-${padded}-bugfix`) || !file.endsWith(".md")) continue;
+      const json = await readBatchResult(path.join(dir, file.replace(/\.md$/, ".json")));
+      if (json.status !== "SUCCESS") continue;
+      candidates.push({ file, order: bugfixJournalOrder(file) });
+    }
+    return candidates
+      .sort((a, b) => b.order - a.order || b.file.localeCompare(a.file))
+      .map((candidate) => ({ file: `.yolo/batch-results/${candidate.file}`, type: "bugfix" }));
   } catch {
     return [];
   }
+}
+
+function bugfixJournalOrder(file: string): number {
+  const match = /-bugfix(?:-(\d+))?\.md$/.exec(file);
+  return match?.[1] ? Number(match[1]) : 1;
 }
 
 async function runJournalAgent(rootCwd: string, cwd: string, batch: Batch, config: RuntimeConfig, context: string): Promise<BatchResult | null> {
@@ -864,8 +1219,10 @@ async function runJournalAgent(rootCwd: string, cwd: string, batch: Batch, confi
   let contract = validateJournalContract(result);
   if (!(contract.passed && result.status === "SUCCESS") && config.recovery?.retryJournalOnce) {
     const retryId = `${id}-retry`;
+    const retryFlags = [...contract.flags, ...resultFlags(result)];
+    await markSelfHeal(rootCwd, "journal", "journal", true, [`retry:${retryId}`, ...retryFlags]);
     await setAgent(rootCwd, "journal", retryId);
-    const retryContext = `${context}\n\n---\n\n# Journal Retry\nPrevious journal failed: ${[...contract.flags, ...resultFlags(result)].join(", ")}. Source result file is ${source.file}; source type is ${source.type}. Rewrite the journal entry and gate evidence, then emit valid JSON.`;
+    const retryContext = `${context}\n\n---\n\n# Journal Retry\nPrevious journal failed: ${retryFlags.join(", ")}. Source result file is ${source.file}; source type is ${source.type}. Rewrite the journal entry and gate evidence, then emit valid JSON.`;
     result = await runSubagent({ id: retryId, role: "journal", promptFile: ".agent/agents/yolo/yolo-subagent-journal.md", context: retryContext, outputBase: `.yolo/batch-results/${retryId}`, cwd, route: config.models.journal, telemetryRoot: rootCwd, promptVars: { BATCH_RESULT_FILE: source.file, BATCH_TYPE: source.type } });
     contract = validateJournalContract(result);
   }
@@ -888,19 +1245,46 @@ async function runValidator(rootCwd: string, cwd: string, batch: Batch, config: 
 }
 
 async function handleRejected(cwd: string, batch: Batch, result: BatchResult, flags: string[], config: RuntimeConfig): Promise<void> {
+  if (config.recovery?.selfHealRuntime && isSelfHealingSafetyBlocker(flags)) await markSelfHeal(cwd, "reject", "safety", false, flags.slice(0, 12));
   await cleanupDockerForBatch(cwd, batch.number, "failure", config);
   const update = await recordFailure(cwd, batch, { ...result, flags }, config.reinforcementThreshold);
   if (update?.thresholdReached && !update.reinforced) await runReinforcement(cwd, batch, flags, config, update.key);
-  await finishRuntime(cwd, "failed", `Batch ${batch.number} rejected: ${flags.join(", ")}`);
+  const terminalMessage = flags.includes("RUNTIME_POISONED_RECOVERY_LOOP")
+    ? runtimePoisonedRecommendation(batch.number, { code: "RUNTIME_POISONED_RECOVERY_LOOP", signature: failureSignature(flags, result.failureType), flags: blockingRecoveryFlags(flags, result.failureType) })
+    : flags.includes("RECOVERY_ATTEMPTS_EXHAUSTED")
+      ? `RECOVERY_ATTEMPTS_EXHAUSTED: Batch ${batch.number} exhausted recovery budget: ${flags.join(", ")}`
+      : `Batch ${batch.number} rejected: ${flags.join(", ")}`;
+  await finishRuntime(cwd, "failed", terminalMessage);
+  if (shouldCapturePoisonedBatchIncidentFixture(flags, result.failureType)) {
+    try {
+      const fixture = await capturePoisonedBatchIncidentFixture(cwd, batch, result, flags);
+      console.error(`Incident fixture captured: ${path.relative(cwd, fixture.dir).split(path.sep).join("/")}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`Incident fixture capture failed: ${message}`);
+    }
+  }
   rejectBatch(batch.number, flags);
+}
+
+export function shouldCapturePoisonedBatchIncidentFixture(flags: string[], failureType?: string | null): boolean {
+  return flags.includes("RUNTIME_POISONED_RECOVERY_LOOP") || runtimeOwnedFailureRequiresStop(failureSignature(flags, failureType));
 }
 
 async function cleanupDockerForBatch(cwd: string, batchNumber: number, outcome: "success" | "failure", config: RuntimeConfig): Promise<void> {
   if (config.docker?.cleanupBatchResources === false) return;
   await setPhase(cwd, "cleanup", `Cleaning Docker resources for batch ${batchNumber}`);
-  const result = await cleanupBatchDockerResources(cwd, batchNumber, outcome, config.docker);
-  if (result.skipped) await writeGate(cwd, "docker-cleanup", `batch-${String(batchNumber).padStart(3, "0")}`, "PASS", batchNumber, [`project:${result.project}`, `skipped:${result.skipped}`]);
-  else await writeGate(cwd, "docker-cleanup", `batch-${String(batchNumber).padStart(3, "0")}`, "PASS", batchNumber, [`project:${result.project}`, ...result.actions]);
+  try {
+    const result = await cleanupBatchDockerResources(cwd, batchNumber, outcome, config.docker);
+    if (result.skipped) await writeGate(cwd, "docker-cleanup", `batch-${String(batchNumber).padStart(3, "0")}`, "PASS", batchNumber, [`project:${result.project}`, `skipped:${result.skipped}`]);
+    else await writeGate(cwd, "docker-cleanup", `batch-${String(batchNumber).padStart(3, "0")}`, "PASS", batchNumber, [`project:${result.project}`, ...result.actions]);
+  } catch (error) {
+    const kind = classifySelfHealError(error);
+    if (!config.recovery?.selfHealRuntime || kind === "safety" || kind === "unknown") throw error;
+    const message = error instanceof Error ? error.message : String(error);
+    await markSelfHeal(cwd, "cleanup", kind, true, [`cleanup-skipped:${message}`]);
+    await writeGate(cwd, "docker-cleanup", `batch-${String(batchNumber).padStart(3, "0")}`, "PASS", batchNumber, [`self-healed:${kind}`, `cleanup-skipped:${message}`]);
+  }
 }
 
 async function runReinforcement(cwd: string, batch: Batch, flags: string[], config: RuntimeConfig, key: string): Promise<void> {

@@ -10,7 +10,9 @@ export async function git(cwd: string, args: string): Promise<string> {
 }
 
 export async function gitStatus(cwd: string): Promise<string[]> {
-  const output = await git(cwd, "status --short");
+  const result = await execCommand("git status --short", cwd, 120000);
+  if (result.exitCode !== 0) throw new Error(result.stderr || result.stdout || "git status --short failed");
+  const output = result.stdout.replace(/\r?\n$/, "");
   return output ? output.split(/\r?\n/) : [];
 }
 

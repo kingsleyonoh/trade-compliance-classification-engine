@@ -4,17 +4,6 @@ function firstNonEmpty(...values: Array<string | undefined>): string | undefined
   return values.find((value) => value !== undefined && value.trim() !== "");
 }
 
-function localDockerDatabaseUrl(): string {
-  return [
-    "postgres",
-    "://",
-    "trade_compliance",
-    ":",
-    "trade_compliance",
-    "@127.0.0.1:55439/trade_compliance",
-  ].join("");
-}
-
 function pickDefaultPlaywrightPort(): string {
   const basePort = 30_000;
   const portSpan = 10_000;
@@ -38,10 +27,6 @@ const playwrightBindPort = portFromBaseUrl(playwrightBaseUrl, playwrightPort);
 const playwrightBindAddr =
   firstNonEmpty(process.env.PLAYWRIGHT_BIND_ADDR) ??
   `127.0.0.1:${playwrightBindPort}`;
-const playwrightDatabaseUrl =
-  firstNonEmpty(process.env.DATABASE_URL, process.env.TEST_DATABASE_URL) ??
-  localDockerDatabaseUrl();
-
 export default defineConfig({
   testDir: "./tests/e2e",
   timeout: 30_000,
@@ -49,19 +34,9 @@ export default defineConfig({
     baseURL: playwrightBaseUrl,
   },
   webServer: {
-    command: "cargo run --bin trade-compliance-classification-engine",
+    command: `node scripts/playwright-webserver.mjs ${playwrightBaseUrl} ${playwrightBindAddr}`,
     url: playwrightBaseUrl,
     reuseExistingServer: true,
     timeout: 300_000,
-    env: {
-      DATABASE_URL: playwrightDatabaseUrl,
-      APP_BASE_URL: playwrightBaseUrl,
-      APP_BIND_ADDR: playwrightBindAddr,
-      JWT_SECRET: firstNonEmpty(process.env.JWT_SECRET) ?? "your-jwt-secret",
-      API_KEY_PEPPER:
-        firstNonEmpty(process.env.API_KEY_PEPPER) ?? "your-api-key-pepper",
-      CARGO_TARGET_DIR:
-        firstNonEmpty(process.env.CARGO_TARGET_DIR) ?? "/tmp/tcce-target",
-    },
   },
 });

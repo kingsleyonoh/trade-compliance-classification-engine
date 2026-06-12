@@ -23,7 +23,7 @@ export function normalizeBatchResult(raw: unknown, fallbackBatch = 0): BatchResu
   const data = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
   const flags = normalizeFlags(data.flags);
   const shapeFlags = malformedShapeFlags(data);
-  const status = typeof data.status === "string" ? data.status as BatchResult["status"] : "INVALID_RESULT";
+  const status = typeof data.status === "string" && isBatchStatus(data.status) ? data.status : "INVALID_RESULT";
   return {
     ...preserveExtraContractFields(data),
     schemaVersion: typeof data.schemaVersion === "number" ? data.schemaVersion : 0,
@@ -39,7 +39,7 @@ export function normalizeBatchResult(raw: unknown, fallbackBatch = 0): BatchResu
     artifacts: normalizeArtifacts(data.artifacts),
     localOnlyFiles: normalizeLocalOnlyFiles(data.localOnlyFiles),
     inbox: normalizeInbox(data.inbox),
-    failureType: typeof data.failureType === "string" ? data.failureType : undefined,
+    failureType: typeof data.failureType === "string" ? data.failureType : typeof data.failure_type === "string" ? data.failure_type : undefined,
     flags: [...new Set([...shapeFlags, ...flags])],
     commit: typeof data.commit === "string" ? data.commit : data.commit === null ? null : undefined
   };
@@ -53,11 +53,13 @@ export function validateContract(result: BatchResult): GateResult {
   const flags = [];
   if (result.schemaVersion !== 1) flags.push("INVALID_SCHEMA_VERSION");
   if (!result.status) flags.push("MISSING_STATUS");
+  if (!isBatchStatus(result.status)) flags.push("INVALID_STATUS");
   if (!Array.isArray(result.itemsCompleted)) flags.push("MISSING_ITEMS_COMPLETED");
   if (!Array.isArray(result.filesChanged)) flags.push("MISSING_FILES_CHANGED");
   if (!Array.isArray(result.flags)) flags.push("MISSING_FLAGS_ARRAY");
-  for (const flag of result.flags ?? []) if (/^INVALID_.*_SHAPE$/.test(flag)) flags.push(flag);
+  for (const flag of result.flags ?? []) if (/^INVALID_(?:STATUS|.*_SHAPE)$/.test(flag)) flags.push(flag);
   if (result.status === "FAILURE" && !result.failureType) flags.push("FAILURE_WITHOUT_FAILURE_TYPE");
+  if (result.status !== "FAILURE" && result.failureType) flags.push(`FAILURE_TYPE_WITH_${result.status}`);
   if (result.status === "FAILURE" && result.failureType) flags.push(`RESULT_STATUS_FAILURE:${result.failureType}`);
   if (result.commit !== null && result.commit !== undefined) flags.push("COMMIT_CLAIMED_BY_AGENT");
   if (result.projectLocalChecks && "triggered" in result.projectLocalChecks && !Array.isArray(result.projectLocalChecks.triggered)) flags.push("INVALID_PROJECT_LOCAL_CHECKS_SHAPE");
@@ -65,8 +67,12 @@ export function validateContract(result: BatchResult): GateResult {
   return { name: "contract", passed: flags.length === 0, flags };
 }
 
+function isBatchStatus(value: string): value is BatchResult["status"] {
+  return value === "SUCCESS" || value === "FAILURE" || value === "PARTIAL_SUCCESS" || value === "BUG_FOUND" || value === "INVALID_RESULT";
+}
+
 function preserveExtraContractFields(data: Record<string, unknown>): Record<string, unknown> {
-  const normalized = new Set(["schemaVersion", "agent", "batch", "status", "itemsCompleted", "filesChanged", "tests", "wiring", "projectLocalChecks", "businessLogic", "artifacts", "localOnlyFiles", "inbox", "failureType", "flags", "commit"]);
+  const normalized = new Set(["schemaVersion", "agent", "batch", "status", "itemsCompleted", "filesChanged", "tests", "wiring", "projectLocalChecks", "businessLogic", "artifacts", "localOnlyFiles", "inbox", "failureType", "failure_type", "flags", "commit"]);
   return Object.fromEntries(Object.entries(data).filter(([key, value]) => !normalized.has(key) && isJsonValue(value)));
 }
 
@@ -79,6 +85,7 @@ function isJsonValue(value: unknown): boolean {
 
 function malformedShapeFlags(data: Record<string, unknown>): string[] {
   const flags: string[] = [];
+  if (typeof data.status === "string" && !isBatchStatus(data.status)) flags.push("INVALID_STATUS");
   if (data.flags !== undefined && !normalizableFlags(data.flags)) flags.push("INVALID_FLAGS_SHAPE");
   if (data.itemsCompleted !== undefined && !normalizableStringList(data.itemsCompleted, itemText)) flags.push("INVALID_ITEMS_COMPLETED_SHAPE");
   if (data.filesChanged !== undefined && !normalizableStringList(data.filesChanged, pathText)) flags.push("INVALID_FILES_CHANGED_SHAPE");

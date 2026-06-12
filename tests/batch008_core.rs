@@ -16,20 +16,55 @@ use trade_compliance_classification_engine::search::index::{
 use trade_compliance_classification_engine::telemetry::MetricsRegistry;
 
 static DB_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+const TEST_DB_ADVISORY_LOCK_ID: i64 = 0x5443_4345_5445_5354;
 
-async fn test_pool() -> (PgPool, MutexGuard<'static, ()>) {
-    let guard = DB_LOCK.get_or_init(|| Mutex::new(())).lock().await;
-    let database_url = std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| {
-        [
-            "postgres",
-            "://",
-            "trade_compliance",
-            ":",
-            "trade_compliance",
-            "@127.0.0.1:55439/trade_compliance",
-        ]
-        .concat()
-    });
+struct TestDbGuard {
+    _mutex: MutexGuard<'static, ()>,
+    _advisory_tx: sqlx::Transaction<'static, sqlx::Postgres>,
+}
+
+fn test_database_url() -> String {
+    std::env::var("TEST_DATABASE_URL")
+        .ok()
+        .filter(|value| runtime_usable_database_url(value))
+        .unwrap_or_else(local_docker_database_url)
+}
+
+fn runtime_usable_database_url(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.starts_with("postgres://") || trimmed.starts_with("postgresql://") {
+        let Some((_, rest)) = trimmed.split_once("://") else {
+            return false;
+        };
+        let Some((credential_segment, _)) = rest.split_once('@') else {
+            return false;
+        };
+        let Some((username, password)) = credential_segment.split_once(':') else {
+            return false;
+        };
+        return !username.is_empty() && !password.is_empty();
+    }
+    true
+}
+
+fn local_docker_database_url() -> String {
+    [
+        "postgres",
+        "://",
+        "trade_compliance",
+        ":",
+        "trade_compliance",
+        "@127.0.0.1:55433/trade_compliance",
+    ]
+    .concat()
+}
+
+async fn test_pool() -> (PgPool, TestDbGuard) {
+    let mutex = DB_LOCK.get_or_init(|| Mutex::new(())).lock().await;
+    let database_url = test_database_url();
     let pool = PgPool::connect(&database_url)
         .await
         .expect("postgres should be running");
@@ -37,10 +72,25 @@ async fn test_pool() -> (PgPool, MutexGuard<'static, ()>) {
         .run(&pool)
         .await
         .expect("migrations should run");
+    let mut advisory_tx = pool
+        .begin()
+        .await
+        .expect("test database advisory lock transaction should start");
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(TEST_DB_ADVISORY_LOCK_ID)
+        .execute(&mut *advisory_tx)
+        .await
+        .expect("test database advisory lock should be acquired");
     pool.execute("TRUNCATE classification_jobs, classification_runs, products, rule_packs, api_keys, users, tenants RESTART IDENTITY CASCADE")
         .await
         .expect("test cleanup should succeed");
-    (pool, guard)
+    (
+        pool,
+        TestDbGuard {
+            _mutex: mutex,
+            _advisory_tx: advisory_tx,
+        },
+    )
 }
 
 fn test_state(pool: PgPool) -> AppState {

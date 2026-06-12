@@ -21,6 +21,7 @@ interface ExecOptions {
   timeoutMs?: number;
   heartbeatMs?: number;
   onHeartbeat?: () => void;
+  env?: NodeJS.ProcessEnv;
 }
 
 export function execCommand(command: string, cwd: string, timeoutMsOrOptions: number | ExecOptions = 600000): Promise<ExecResult> {
@@ -28,7 +29,7 @@ export function execCommand(command: string, cwd: string, timeoutMsOrOptions: nu
   const timeoutMs = options.timeoutMs ?? 600000;
   const invocation = buildCommandInvocation(command, cwd);
   return new Promise((resolve) => {
-    const child = spawn(invocation.file, invocation.args, { cwd, shell: invocation.shell, stdio: ["ignore", "pipe", "pipe"], detached: platform() !== "win32" });
+    const child = spawn(invocation.file, invocation.args, { cwd, shell: invocation.shell, stdio: ["ignore", "pipe", "pipe"], detached: platform() !== "win32", env: options.env ? { ...process.env, ...options.env } : process.env });
     let stdout = "";
     let stderr = "";
     let settled = false;
@@ -73,12 +74,73 @@ function killProcessTree(pid: number | undefined): void {
 
 export function buildCommandInvocation(command: string, cwd: string, os: NodeJS.Platform = platform()): CommandInvocation {
   if (os === "win32") {
+    if (isGitOnlyCommand(command)) {
+      const normalized = normalizeCommand(normalizeWindowsGitCommand(command), cwd, os);
+      return { file: normalized.command, args: [], shell: true, display: normalized.display };
+    }
+    const directNode = buildDirectNodeInvocation(command);
+    if (directNode) return directNode;
     const bash = findBash();
     if (bash) return { file: bash, args: ["-lc", command], shell: false, display: `bash -lc ${JSON.stringify(command)}` };
     const normalized = normalizeCommand(command, cwd, os);
     return { file: normalized.command, args: [], shell: true, display: normalized.display };
   }
   return { file: command, args: [], shell: true, display: command };
+}
+
+function buildDirectNodeInvocation(command: string): CommandInvocation | null {
+  if (/[|<>;&]/.test(command)) return null;
+  const parts = splitCommand(command);
+  if (!parts.length || !/^node(?:\.exe)?$/i.test(parts[0] ?? "")) return null;
+  return { file: parts[0]!, args: parts.slice(1), shell: false, display: command };
+}
+
+function splitCommand(command: string): string[] {
+  const parts: string[] = [];
+  let current = "";
+  let quote: "'" | '"' | null = null;
+  let escaping = false;
+  for (const char of command.trim()) {
+    if (escaping) {
+      current += char;
+      escaping = false;
+      continue;
+    }
+    if (char === "\\") {
+      escaping = true;
+      continue;
+    }
+    if (quote) {
+      if (char === quote) quote = null;
+      else current += char;
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quote = char;
+      continue;
+    }
+    if (/\s/.test(char)) {
+      if (current) {
+        parts.push(current);
+        current = "";
+      }
+      continue;
+    }
+    current += char;
+  }
+  if (escaping) current += "\\";
+  if (current) parts.push(current);
+  return quote ? [] : parts;
+}
+
+function isGitOnlyCommand(command: string): boolean {
+  if (/[|<>;]/.test(command)) return false;
+  const parts = command.split(/&&|\|\|/).map((part) => part.trim()).filter(Boolean);
+  return parts.length > 0 && parts.every((part) => /^git(?:\.exe)?(?:\s|$)/i.test(part));
+}
+
+function normalizeWindowsGitCommand(command: string): string {
+  return command.replace(/'([^']*)'/g, (_match, quoted: string) => JSON.stringify(quoted));
 }
 
 export function normalizeCommand(command: string, cwd: string, os: NodeJS.Platform = platform()): { command: string; display: string } {

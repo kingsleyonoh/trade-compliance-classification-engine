@@ -6,6 +6,7 @@ export interface TelegramNotificationEnv {
   KLEVAR_TELEGRAM_CHAT_ID?: string;
   KLEVAR_TELEGRAM_NOTIFY?: string;
   KLEVAR_TELEGRAM_NOTIFY_COMPLETE?: string;
+  KLEVAR_TELEGRAM_NOTIFY_TESTS?: string;
 }
 
 export interface RuntimeNotification {
@@ -23,6 +24,7 @@ export function telegramEnabled(env: TelegramNotificationEnv = process.env): boo
 
 export function shouldNotifyRuntimeFinish(event: RuntimeNotification, env: TelegramNotificationEnv = process.env): boolean {
   if (!telegramEnabled(env)) return false;
+  if (isRuntimeTestProject(event.cwd) && env.KLEVAR_TELEGRAM_NOTIFY_TESTS !== "1" && env.KLEVAR_TELEGRAM_NOTIFY_TESTS !== "true") return false;
   if (event.status === "failed") return true;
   return env.KLEVAR_TELEGRAM_NOTIFY_COMPLETE === "1" || env.KLEVAR_TELEGRAM_NOTIFY_COMPLETE === "true";
 }
@@ -30,6 +32,10 @@ export function shouldNotifyRuntimeFinish(event: RuntimeNotification, env: Teleg
 export async function notifyRuntimeFinish(event: RuntimeNotification, env: TelegramNotificationEnv = process.env): Promise<void> {
   if (!shouldNotifyRuntimeFinish(event, env)) return;
   await sendTelegramMessage(env.KLEVAR_TELEGRAM_BOT_TOKEN!, env.KLEVAR_TELEGRAM_CHAT_ID!, formatRuntimeNotification(event));
+}
+
+function isRuntimeTestProject(cwd: string): boolean {
+  return /(?:^|[\\/])klevar-yolo-test-[^\\/]+$/i.test(cwd);
 }
 
 export function formatRuntimeNotification(event: RuntimeNotification): string {

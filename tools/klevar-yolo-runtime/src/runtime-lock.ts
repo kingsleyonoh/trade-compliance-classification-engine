@@ -13,6 +13,11 @@ export interface RuntimeLock {
 
 export function acquireRuntimeLock(cwd: string, scope: string, staleMs = 10 * 60_000): { ok: true; lock: RuntimeLock } | { ok: false; reason: string } {
   const existing = readRuntimeLock(cwd);
+  if (existing?.pid === process.pid) {
+    const lock = { ...existing, heartbeatAt: new Date().toISOString(), scope };
+    writeRuntimeLock(cwd, lock);
+    return { ok: true, lock };
+  }
   if (existing && processAlive(existing.pid) && Date.now() - Date.parse(existing.heartbeatAt) < staleMs) return { ok: false, reason: `active runtime pid ${existing.pid} (${existing.scope})` };
   if (existing && processAlive(existing.pid)) stopProcessTree(existing.pid);
   if (existing) clearRuntimeLock(cwd);

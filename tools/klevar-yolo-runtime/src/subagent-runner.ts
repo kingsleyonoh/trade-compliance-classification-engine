@@ -254,6 +254,7 @@ You MUST write both output files before finishing:
 - Do NOT put plain strings in test evidence, e.g. \`"red": "passed"\`. Every test evidence object needs \`command\`, \`exitCode\`, and \`evidence\`.
 - Do NOT write descriptive labels as runnable commands. If live E2E required several shell steps, put an exact executable script/command in \`command\` or use \`command: "not applicable"\` and put artifact details in \`evidence\` and \`artifacts\`.
 - Do NOT claim a commit hash. Always write \`commit: null\`; the runtime owns commits.
+- Do NOT edit, recreate, delete, or list protected coordination/template-managed paths as deliverables: \`.agent/rules/\`, \`.agent/workflows/\`, \`.agent/guides/\`, \`.agent/agents/\`, \`AGENTS.md\`, \`CLAUDE.md\`, \`.cursorrules\`, \`.yolo/runtime.config.json\`, \`.yolo/runtime-state.json\`, runtime logs/events/worktrees, or secret files (\`.env*\`, \`*.pem\`, \`*.key\`). Support/refactor/audit batches must report blockers instead of touching these paths.
 - If Active Project-Local Checks are present, report how many were evaluated and any triggered checks.
 - If the PRD calls for mobile, offline/PWA, privacy/consent, or bundle discipline, include objective evidence and flags such as MOBILE_VIEWPORT_PASS, OFFLINE_PWA_PASS, PRIVACY_MATRIX_PASS, and BUNDLE_DYNAMIC_IMPORT_AUDIT_PASS when those concerns are touched.`;
 }
