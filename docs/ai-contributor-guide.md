@@ -5,9 +5,9 @@ Use this guide when contributing with Claude Code, Codex, Cursor, Pi, or another
 ## Start Here
 
 1. Work from `dev` and create a feature branch: `feature/<short-slug>`.
-2. Read `docs/progress.md` and choose one unchecked task.
-3. Create a claim in `docs/claims/<slug>.json` before editing.
-4. Read `.agent/rules/_index.md` and the core rules it lists.
+2. Choose a clearly scoped issue, ticket, or documented change request.
+3. If your team uses private coordination ledgers, create/claim the task before editing.
+4. Read `.agent/rules/_index.md` and the core rules it lists when those files are present.
 5. Use TDD: RED, GREEN, regression.
 6. Run secret scan before opening a PR.
 
@@ -38,8 +38,8 @@ Use this guide when contributing with Claude Code, Codex, Cursor, Pi, or another
 
 Include:
 
-- task/progress item
-- claim file path
+- linked issue/task, or a note explaining why none exists
+- claim file path if your team uses private claims
 - tests run and output summary
 - E2E evidence if API/UI/JOB/INTEGRATION changed
 - secret scan result

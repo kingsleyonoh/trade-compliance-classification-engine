@@ -260,16 +260,13 @@ npx playwright test
 
 ## AI Integration
 
-This project includes machine-readable context for AI tools:
+This project includes machine-readable public context for external tools:
 
 | File | What it does |
 |------|-------------|
 | [`openapi.yaml`](openapi.yaml) | OpenAPI 3.1 API specification |
-| [`AGENTS.md`](AGENTS.md) | Full codebase instructions for AI coding agents |
-
-### Cursor / Other AI IDEs
-
-Point your AI agent at `AGENTS.md` for full codebase context.
+| [`llms.txt`](llms.txt) | LLM-oriented project summary and entry points |
+| [`mcp.json`](mcp.json) | MCP discovery metadata |
 
 ## Deployment
 

@@ -22,8 +22,10 @@ const KNOWN_TAGS: &[&str] = &[
 
 #[test]
 fn progress_checklist_items_are_structured_runtime_items() {
-    let progress =
-        std::fs::read_to_string("docs/progress.md").expect("docs/progress.md is readable");
+    let Ok(progress) = std::fs::read_to_string("docs/progress.md") else {
+        // docs/progress.md is an internal development ledger stripped from public releases.
+        return;
+    };
     let scan = scan_progress_items(&progress);
     let failures = progress_scan_failures(scan);
 
