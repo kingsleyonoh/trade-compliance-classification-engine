@@ -18,21 +18,19 @@ Thumbs.db
 .idea/
 
 # AI Workflow System (proprietary — do not publish)
-# ⚠️ TRACKED DURING DEV — run /prepare-public before making repo public
-# .agent/workflows/
-# .agent/guides/
-# .agent/agents/
+.agent/workflows/
+.agent/guides/
+.agent/agents/
 .agent/.last-sync
 
 # Internal project planning
-# ⚠️ TRACKED DURING DEV — run /prepare-public before making repo public
-# docs/progress.md
-# docs/yolo-inbox.md
-# docs/build-journal.md
-# docs/build-journal/
+docs/progress.md
+docs/yolo-inbox.md
+docs/build-journal.md
+docs/build-journal/
 docs/architect_journal.md
-# docs/*PRD*.md
-# docs/*prd*.md
+docs/*PRD*.md
+docs/*prd*.md
 
 # YOLO runtime generated artifacts (always ignored)
 tools/klevar-yolo-runtime/node_modules/
@@ -45,19 +43,13 @@ tools/klevar-yolo-runtime/dist/
 .yolo/runtime-state.json
 
 # YOLO Mode workspace — audit trail
-# ⚠️ TRACKED DURING DEV — run /prepare-public before making repo public
-# ⛔ NEVER write production API keys, tokens, passwords, or any real
-#    credential to ANY file under .yolo/ — these files commit to git
-#    history on every YOLO push. Use os.environ[...] / process.env[...]
-#    / ${VAR} instead.
-# .yolo/
+.yolo/
 
 # Multi-agent platform context
 CLAUDE.md
 AGENTS.md
 .cursorrules
-# ⚠️ TRACKED DURING DEV — run /prepare-public before making repo public
-# .claude/
+.claude/
 .claude/settings.local.json
 .claude/projects/
 .claude/ide/
