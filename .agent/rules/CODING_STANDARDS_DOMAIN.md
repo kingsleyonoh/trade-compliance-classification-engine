@@ -1,4 +1,4 @@
-# {{PROJECT_NAME}} — Coding Standards: Domain & Production
+# Trade Compliance Classification Engine — Coding Standards: Domain & Production
 
 > Part 4 of 4. Also loaded: `CODING_STANDARDS.md`, `CODING_STANDARDS_TESTING.md`, `CODING_STANDARDS_TESTING_LIVE.md`
 
@@ -6,7 +6,7 @@
 
 ### Dev Branch Workflow
 1. All implementation work happens on `dev` branch
-2. Tests run against local services ({{LOCAL_SERVICES}})
+2. Tests run against local services (local PostgreSQL via Docker Compose)
 3. Each completed item → commit → push to `dev`
 4. Run full test suite frequently
 

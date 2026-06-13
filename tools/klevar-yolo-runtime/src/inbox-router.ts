@@ -15,8 +15,8 @@ export interface InboxEntry {
 export async function readPendingInbox(cwd: string): Promise<InboxEntry[]> {
   const file = path.join(cwd, "docs/yolo-inbox.md");
   if (!(await exists(file))) return [];
-  const text = await readText(file);
-  const pending = text.split(/## Pending/i)[1]?.split(/## Handled/i)[0] ?? "";
+  const text = stripHtmlComments(await readText(file));
+  const pending = markdownSection(text, "Pending", "Handled");
   const chunks = pending.split(/\n(?=###\s+)/).filter((chunk) => chunk.trim().startsWith("###"));
   return chunks.map(parseEntry);
 }
@@ -84,16 +84,43 @@ export async function reconcileInbox(cwd: string, result: BatchResult): Promise<
     if (!match) continue;
     text = text.replace(match[0], "\n");
     const handledBlock = `\n### ${title} — handled ${new Date().toISOString().slice(0, 10)}\n**Handled by:** batch ${result.batch}\n**Approach taken:** runtime result marked this inbox entry handled.\n\n---\n`;
-    text = text.replace(/(## Handled\s*)/i, `$1${handledBlock}`);
+    text = replaceMarkdownHeading(text, "Handled", handledBlock);
     moved += 1;
   }
   if (moved > 0) await writeText(file, text);
   return moved;
 }
 
+function stripHtmlComments(text: string): string {
+  return text.replace(/<!--[\s\S]*?-->/g, "");
+}
+
+function markdownSection(text: string, startHeading: string, endHeading: string): string {
+  const start = headingMatch(text, startHeading);
+  if (!start) return "";
+  const startIndex = start.index ?? 0;
+  const afterStart = startIndex + start[0].length;
+  const end = headingMatch(text.slice(afterStart), endHeading);
+  const endIndex = end?.index ?? -1;
+  return endIndex >= 0 ? text.slice(afterStart, afterStart + endIndex) : text.slice(afterStart);
+}
+
+function replaceMarkdownHeading(text: string, heading: string, insert: string): string {
+  const match = headingMatch(text, heading);
+  if (!match) return text;
+  const index = match.index ?? 0;
+  return `${text.slice(0, index + match[0].length)}${insert}${text.slice(index + match[0].length)}`;
+}
+
+function headingMatch(text: string, heading: string): RegExpMatchArray | null {
+  const pattern = new RegExp(`^##\\s+${escapeRegExp(heading)}\\s*$`, "im");
+  return text.match(pattern);
+}
+
 function parseEntry(chunk: string): InboxEntry {
   const title = chunk.match(/^###\s+(.+)$/m)?.[1]?.trim() ?? "Untitled inbox entry";
-  const priority = /\[HIGH\]|priority\s*:\s*high|urgent|block|critical|before next batch|stop/i.test(chunk) ? "HIGH" : /\[LOW\]|priority\s*:\s*low|cosmetic|docs|nice-to-have/i.test(chunk) ? "LOW" : "MEDIUM";
+  const priorityText = field(chunk, "Priority") ?? field(chunk, "Urgency hint") ?? "";
+  const priority = /^high$/i.test(priorityText) || /\[HIGH\]|urgent|block|critical|before next batch|stop/i.test(chunk) ? "HIGH" : /^low$/i.test(priorityText) || /\[LOW\]|cosmetic|docs|nice-to-have/i.test(chunk) ? "LOW" : "MEDIUM";
   return { title, priority, body: chunk, affectedFiles: parseAffectedFiles(chunk), type: field(chunk, "Type"), date: title.match(/—\s*(\d{4}-\d{2}-\d{2})/)?.[1] };
 }
 

@@ -1,0 +1,32 @@
+# Trade Compliance Classification Engine
+
+Repo: https://github.com/kingsleyonoh/trade-compliance-classification-engine.git
+
+Multi-tenant Rust/Axum compliance workbench that converts product catalogs into explainable HS/HTS recommendations, duty estimates, risk bands, reviewer queues, and immutable audit packs.
+
+## Install / Run
+
+- Install: `cargo build`
+- Infra: `docker compose up -d`
+- Dev: `cargo run`
+- Setup: `cargo run --bin setup`
+- Tests: `cargo test`
+
+## Architecture
+
+Rust 1.78+, Axum, PostgreSQL 16/sqlx, Tantivy local search, wasmtime rule runtime, Askama/HTMX/Tailwind UI, Tokio workers, Prometheus metrics.
+
+## API Surface
+
+Health: `GET /health`, `/health/db`, `/health/ready`.
+Tenant bootstrap: `POST /api/tenants/register`, `GET /tenants/me`.
+Products: `POST /api/products/import`, `GET /api/products`, `GET /api/products/:id`.
+Classifications: `POST /api/classifications/run`, `GET /api/classifications`, `GET /api/classifications/:id`, `POST /api/classifications/:id/override`.
+Rule packs: `POST /api/rule-packs`, `POST /api/rule-packs/:id/validate`, `POST /api/rule-packs/:id/activate`.
+Exports: `POST /api/audit-exports`, `GET /api/audit-exports/:id/download`.
+Integrations: `GET /api/integrations`, `PUT /api/integrations/:provider`.
+Backtests: `POST /api/backtests/run`.
+
+## Integrations
+
+Optional RAG Platform, Notification Hub, and Workflow Automation Engine. Core classification, review, and audit export must work with all adapters disabled.

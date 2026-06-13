@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { pruneFailurePatternsForBatch } from "./failure-patterns.js";
 import { exists } from "./util/fs.js";
 import { git } from "./util/git.js";
+import { cleanupBatchDockerResources } from "./docker-cleanup.js";
 
 export interface RecoveryResult {
   ok: boolean;
@@ -20,6 +21,8 @@ export interface UndoOptions {
 export async function cleanBatch(cwd: string, batchArg: string, options: { logs?: boolean } = {}): Promise<RecoveryResult> {
   const batch = normalizeBatch(batchArg);
   const actions: string[] = [];
+  const docker = await cleanupBatchDockerResources(cwd, Number(batch), "failure");
+  actions.push(...(docker.skipped ? [`docker cleanup skipped: ${docker.skipped}`] : docker.actions.map((action) => `docker ${docker.project} ${action}`)));
   await removeWorktree(cwd, batch, actions);
   await tryGit(cwd, "worktree prune", actions);
   await tryGit(cwd, `branch -D yolo/batch-${batch}`, actions);

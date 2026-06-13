@@ -1,0 +1,32 @@
+{
+  "kind": "runtime-classification",
+  "batch": 16,
+  "implementation": {
+    "schemaVersion": 1,
+    "agent": "implement",
+    "batch": 16,
+    "status": "FAILURE",
+    "itemsCompleted": [],
+    "filesChanged": ["src/contracts/commercial.ts", ".yolo/runtime/batches/batch-016/state.json"],
+    "tests": {},
+    "failureType": "RUNTIME_POISONED_RECOVERY_LOOP",
+    "flags": ["RUNTIME_POISONED_RECOVERY_LOOP", "BUGFIX_RESULT_INVALID", "BUSINESS_LOGIC_RULE_MISSING:discount-threshold"],
+    "commit": null
+  },
+  "recovery": {
+    "schemaVersion": 1,
+    "agent": "bugfix",
+    "batch": 16,
+    "status": "SUCCESS",
+    "itemsCompleted": [],
+    "filesChanged": [".yolo/batch-results/batch-016-bugfix.json"],
+    "tests": { "regression": { "command": "npm test -- --poisoned-recovery", "exitCode": 0, "evidence": "poisoned exit detected" } },
+    "flags": ["FIXED:RUNTIME_POISONED_RECOVERY_LOOP"],
+    "commit": null
+  },
+  "expectedClassification": "mixed",
+  "expectedActiveBlockers": ["BUSINESS_LOGIC_RULE_MISSING:discount-threshold"],
+  "expectedQuarantinedStaleFindings": ["BUGFIX_RESULT_INVALID", "RUNTIME_POISONED_RECOVERY_LOOP"],
+  "expectedRecommendationIncludes": "product blockers remain active",
+  "expectBugfixDispatch": false
+}

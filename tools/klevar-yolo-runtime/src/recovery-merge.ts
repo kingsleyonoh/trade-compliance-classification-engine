@@ -1,11 +1,15 @@
 import path from "node:path";
-import type { BatchResult } from "./types.js";
+import type { BatchResult, TestEvidence } from "./types.js";
 import { normalizeTests, readBatchResult } from "./result-contracts.js";
+import { isRuntimeOwnedPath } from "./path-policy.js";
 
 export async function mergeRecoveredResultFromDisk(cwd: string, batchNumber: number, implementation: BatchResult, bugfix: BatchResult): Promise<BatchResult> {
   const correctedManifest = correctedSourceManifestPath(batchNumber, implementation, bugfix);
   if (!correctedManifest) return mergeRecoveredResult(implementation, bugfix);
   const corrected = await readBatchResult(path.join(cwd, correctedManifest));
+  if (corrected.status === "INVALID_RESULT" || (corrected.status !== "SUCCESS" && corrected.failureType === "INVALID_RESULT")) {
+    return mergeRecoveredResult(implementation, { ...bugfix, filesChanged: (bugfix.filesChanged ?? []).filter((changedFile) => normalizeRel(changedFile) !== correctedManifest) });
+  }
   const bugfixWithoutManifestRewrite: BatchResult = {
     ...bugfix,
     filesChanged: (bugfix.filesChanged ?? []).filter((changedFile) => normalizeRel(changedFile) !== correctedManifest)
@@ -25,21 +29,24 @@ export function mergeRecoveredResult(implementation: BatchResult, bugfix: BatchR
     failureType: undefined,
     itemsCompleted: [...new Set([...(implementation.itemsCompleted ?? []), ...(bugfix.itemsCompleted ?? [])])],
     filesChanged,
-    tests: mergeRecoveredTests(implementation.tests, bugfix.tests),
-    wiring: mergeRecoveredWiring(implementation.wiring, bugfix.wiring),
+    tests: mergeRecoveredTests(implementation.tests, bugfix.tests, bugfixCanReplaceRedEvidence(bugfix)),
+    wiring: mergeRecoveredWiring(implementation.wiring, bugfix.wiring, bugfixHasSemanticChange(bugfix)),
     projectLocalChecks: mergeProjectLocalChecks(implementation.projectLocalChecks, bugfix.projectLocalChecks),
-    businessLogic: mergeBusinessLogic(implementation.businessLogic, bugfix.businessLogic),
-    localOnlyFiles: mergeLocalOnlyFiles(implementation.localOnlyFiles, bugfix.localOnlyFiles),
+    businessLogic: mergeBusinessLogic(implementation.businessLogic, bugfix.businessLogic, bugfixHasSemanticChange(bugfix)),
+    localOnlyFiles: mergeLocalOnlyFiles(implementation.localOnlyFiles, bugfix.localOnlyFiles, bugfixHasSemanticChange(bugfix)),
     inbox: bugfix.inbox ?? implementation.inbox,
     artifacts,
-    flags: recoveredFlags(implementation, bugfix),
+    flags: recoveredFlags(implementation, bugfix, bugfixHasSemanticChange(bugfix)),
     commit: null
   };
 }
 
 function mergeFilesChanged(implementation: BatchResult, bugfix: BatchResult, correctedManifest: boolean, removedStalePaths: Set<string>): string[] {
   const source = correctedManifest ? (bugfix.filesChanged ?? []) : [...(implementation.filesChanged ?? []), ...(bugfix.filesChanged ?? [])];
-  return [...new Set(source)].filter((file) => !removedStalePaths.has(file.replace(/\\/g, "/")));
+  const bugfixPaths = new Set((bugfix.filesChanged ?? []).map((file) => normalizeRel(file)));
+  return [...new Set(source)]
+    .filter((file) => !isRuntimeOwnedPath(normalizeRel(file)))
+    .filter((file) => !removedStalePaths.has(normalizeRel(file)) || bugfixPaths.has(normalizeRel(file)));
 }
 
 function mergeArtifacts(implementation: BatchResult, bugfix: BatchResult, removedStalePaths: Set<string>): BatchResult["artifacts"] {
@@ -47,8 +54,8 @@ function mergeArtifacts(implementation: BatchResult, bugfix: BatchResult, remove
     .filter((artifact) => !removedStalePaths.has((artifact.path ?? "").replace(/\\/g, "/")));
 }
 
-export function mergeRecoveredWiring(implementation: BatchResult["wiring"], bugfix: BatchResult["wiring"]): BatchResult["wiring"] {
-  if (!bugfix) return implementation;
+export function mergeRecoveredWiring(implementation: BatchResult["wiring"], bugfix: BatchResult["wiring"], allowBugfixWiringEvidence = true): BatchResult["wiring"] {
+  if (!bugfix || !allowBugfixWiringEvidence) return implementation;
   if (!implementation?.entrypoints?.length) return normalizeWiring(bugfix);
   const byPath = new Map<string, { type: string; path: string; verifiedBy: string }>();
   for (const entry of implementation.entrypoints ?? []) {
@@ -87,17 +94,56 @@ function normalizeWiringEntry(entry: unknown): { type: string; path: string; ver
   };
 }
 
-export function mergeRecoveredTests(implementation: BatchResult["tests"], bugfix: BatchResult["tests"]): BatchResult["tests"] {
+export function mergeRecoveredTests(implementation: BatchResult["tests"], bugfix: BatchResult["tests"], allowBugfixRedEvidence = true): BatchResult["tests"] {
   const normalizedBugfix = normalizeTests(bugfix);
   if (!normalizedBugfix) return implementation;
   return {
     ...implementation,
     ...normalizedBugfix,
-    red: normalizedBugfix.red ?? implementation?.red,
-    green: normalizedBugfix.green ?? implementation?.green,
-    regression: normalizedBugfix.regression ?? implementation?.regression,
-    e2e: normalizedBugfix.e2e ?? implementation?.e2e
+    red: allowBugfixRedEvidence ? normalizedBugfix.red ?? implementation?.red : implementation?.red,
+    green: strongerTestEvidence(implementation?.green, normalizedBugfix.green),
+    regression: strongerTestEvidence(implementation?.regression, normalizedBugfix.regression),
+    e2e: strongerE2eEvidence(implementation?.e2e, normalizedBugfix.e2e)
   };
+}
+
+function bugfixCanReplaceRedEvidence(bugfix: BatchResult): boolean {
+  return (bugfix.filesChanged ?? []).some((file) => isTestLikePath(normalizeRel(file)) && !isRuntimeOnlyArtifactPath(normalizeRel(file)));
+}
+
+function bugfixHasSemanticChange(bugfix: BatchResult): boolean {
+  return (bugfix.filesChanged ?? []).some((file) => !isRuntimeOnlyArtifactPath(normalizeRel(file)));
+}
+
+function isRuntimeOnlyArtifactPath(file: string): boolean {
+  return /^\.yolo\/(?:batch-results|gates|runtime|logs|events)\//i.test(file) || isRuntimeOwnedPath(file);
+}
+
+function isTestLikePath(file: string): boolean {
+  return /(^|\/)(tests?|spec|__tests__|cypress|playwright)(\/|$)/i.test(file) || /(?:^|\/)[^/]+\.(?:test|spec)\.[^/]+$/i.test(file);
+}
+
+function strongerTestEvidence(existing: TestEvidence | undefined, candidate: TestEvidence | undefined): TestEvidence | undefined {
+  if (!candidate) return existing;
+  if (!existing) return candidate;
+  const existingRunnablePass = isRunnableTestEvidence(existing) && existing.exitCode === 0;
+  const candidateRunnablePass = isRunnableTestEvidence(candidate) && candidate.exitCode === 0;
+  if (existingRunnablePass && !candidateRunnablePass) return existing;
+  return candidate;
+}
+
+function strongerE2eEvidence(existing: (TestEvidence & { required: boolean }) | undefined, candidate: (TestEvidence & { required: boolean }) | undefined): (TestEvidence & { required: boolean }) | undefined {
+  if (!candidate) return existing;
+  if (!existing) return candidate;
+  const existingRunnablePass = isRunnableTestEvidence(existing) && existing.exitCode === 0;
+  const candidateRunnablePass = isRunnableTestEvidence(candidate) && candidate.exitCode === 0;
+  if (existingRunnablePass && !candidateRunnablePass) return existing;
+  return candidate;
+}
+
+function isRunnableTestEvidence(evidence: { command?: string }): boolean {
+  const command = evidence.command?.trim() ?? "";
+  return command.length > 0 && !/^(?:N\/?A|not applicable|not run|skipped|none|manual)$/i.test(command);
 }
 
 function mergeProjectLocalChecks(implementation: BatchResult["projectLocalChecks"], bugfix: BatchResult["projectLocalChecks"]): BatchResult["projectLocalChecks"] {
@@ -109,8 +155,8 @@ function mergeProjectLocalChecks(implementation: BatchResult["projectLocalChecks
   };
 }
 
-export function mergeBusinessLogic(implementation: BatchResult["businessLogic"], bugfix: BatchResult["businessLogic"]): BatchResult["businessLogic"] {
-  if (!bugfix) return implementation;
+export function mergeBusinessLogic(implementation: BatchResult["businessLogic"], bugfix: BatchResult["businessLogic"], allowBugfixBusinessEvidence = true): BatchResult["businessLogic"] {
+  if (!bugfix || !allowBugfixBusinessEvidence) return implementation;
   if (!implementation) return bugfix;
   return {
     rule: richerText(bugfix.rule, implementation.rule),
@@ -126,15 +172,16 @@ function richerText(candidate: string | undefined, fallback: string | undefined)
   return candidate.length >= fallback.length || /fixed|verified|regression|e2e|passed/i.test(candidate) ? candidate : fallback;
 }
 
-function mergeLocalOnlyFiles(implementation: string[] | undefined, bugfix: string[] | undefined): string[] {
-  if (bugfix !== undefined) return [...new Set(bugfix)];
+function mergeLocalOnlyFiles(implementation: string[] | undefined, bugfix: string[] | undefined, allowBugfixLocalOnlyEvidence: boolean): string[] {
+  if (allowBugfixLocalOnlyEvidence && bugfix !== undefined) return [...new Set(bugfix)];
   return [...new Set(implementation ?? [])];
 }
 
-function recoveredFlags(implementation: BatchResult, bugfix: BatchResult): string[] {
+function recoveredFlags(implementation: BatchResult, bugfix: BatchResult, semanticBugfix: boolean): string[] {
   const sourceFailure = implementation.failureType;
   const sourceFlags = (implementation.flags ?? []).map((flag) => demoteRecoveredSourceFlag(flag, sourceFailure));
-  const bugfixFlags = (bugfix.flags ?? []).map((flag) => normalizeRecoveredBugfixFlag(flag));
+  const evidenceBackedRuntimeRecovery = !semanticBugfix && bugfixHasPassingCommandEvidence(bugfix);
+  const bugfixFlags = (bugfix.flags ?? []).map((flag) => normalizeRecoveredBugfixFlag(flag, semanticBugfix, evidenceBackedRuntimeRecovery)).filter((flag): flag is string => Boolean(flag));
   return [...new Set([
     ...(sourceFailure ? [`RECOVERED_FROM:${sourceFailure}`] : []),
     ...sourceFlags,
@@ -148,9 +195,23 @@ function demoteRecoveredSourceFlag(flag: string, failureType?: string): string {
   return flag;
 }
 
-function normalizeRecoveredBugfixFlag(flag: string): string {
+function normalizeRecoveredBugfixFlag(flag: string, semanticBugfix: boolean, evidenceBackedRuntimeRecovery = false): string | null {
   if (/^RESULT_STATUS_FAILURE:/.test(flag)) return `RECOVERED_BUGFIX_HISTORY:${flag}`;
+  if (!semanticBugfix && isSemanticFixFlag(flag) && !(evidenceBackedRuntimeRecovery && isRuntimeRecoveryEvidenceFlag(flag))) return null;
   return flag;
+}
+
+function bugfixHasPassingCommandEvidence(bugfix: BatchResult): boolean {
+  return Object.values(bugfix.tests ?? {}).some((evidence) => evidence && typeof evidence === "object" && "exitCode" in evidence && Number(evidence.exitCode) === 0 && typeof evidence.command === "string" && evidence.command.trim().length > 0);
+}
+
+function isRuntimeRecoveryEvidenceFlag(flag: string): boolean {
+  return /^BUSINESS_LOGIC_EVIDENCE_.+_(?:PASS|PASSED|VERIFIED)$/i.test(flag)
+    || /^(?:BUSINESS_LOGIC_DRIFT_SWEEP_PASS|TENANT_FAIRNESS_RATE_LIMIT_RETRY_PASS|GENERATED_FILE_DRIFT_REVERTED)$/i.test(flag);
+}
+
+function isSemanticFixFlag(flag: string): boolean {
+  return /(?:_FIXED|_PASS|_PASSED|_ALLOWLISTED|_SATISFIED|_ENFORCED|_REJECTED|_COVERED)$/i.test(flag);
 }
 
 function isActiveFailureFlag(flag: string, failureType?: string): boolean {
@@ -159,7 +220,7 @@ function isActiveFailureFlag(flag: string, failureType?: string): boolean {
   if (/^RESULT_STATUS_FAILURE:/.test(flag)) return true;
   if (/^(BUG_FOUND|INVALID_RESULT|FAILURE_WITHOUT_FAILURE_TYPE|COMMIT_CLAIMED_BY_AGENT)$/.test(flag)) return true;
   if (/^(BLOCKED_PATH|PROTECTED_PATH|SECRET_PATTERN|ARTIFACT_MISSING|CHANGED_FILE_MISSING|LOCAL_ONLY_FILE_MISSING|WIRING_VERIFIER_FILE_MISSING):/.test(flag)) return true;
-  if (/(^|_)(FAILURE|FAILED|REJECTED|MISSING|GAP|INVALID|BLOCKING)(_|$|:)/.test(flag) && !/(^|_)(FIXED|PASS|PASSED|NORMALIZED|RECORDED|NOT_APPLICABLE)(_|$|:)/.test(flag)) return true;
+  if (/(^|_)(FAILURE|FAILED|REJECTED|MISSING|GAP|INVALID|BLOCKING|FINDINGS)(_|$|:)/.test(flag) && !/(^|_)(FIXED|PASS|PASSED|NORMALIZED|RECORDED|NOT_APPLICABLE)(_|$|:)/.test(flag)) return true;
   return false;
 }
 
@@ -172,8 +233,9 @@ function correctedSourceManifestPath(batchNumber: number, source: BatchResult, b
 
 function touchesAnySourceManifest(source: BatchResult, bugfix: BatchResult): boolean {
   const sourceSuffix = source.agent === "audit" ? "audit" : source.agent === "validate" ? "validate" : "implement";
-  const pattern = new RegExp(`^\\.yolo/batch-results/batch-\\d+-${sourceSuffix}\\.json$`);
-  return Boolean(bugfix.filesChanged?.map(normalizeRel).some((file) => pattern.test(file)));
+  const padded = String(source.batch).padStart(3, "0");
+  const expected = `.yolo/batch-results/batch-${padded}-${sourceSuffix}.json`;
+  return Boolean(bugfix.filesChanged?.map(normalizeRel).some((file) => file === expected));
 }
 
 function normalizeRel(file: string): string {

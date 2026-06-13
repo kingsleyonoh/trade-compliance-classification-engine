@@ -25,7 +25,7 @@ export async function runSubagent(invocation: SubagentInvocation): Promise<Batch
     try {
       await appendSubagentEvent(invocation.cwd, invocation.id, { type: "agent_attempt_started", role: invocation.role, attempt, sessionFile: rel(invocation.cwd, sessionFile) });
       await clearSubagentOutput(invocation.cwd, invocation.outputBase);
-      await runAgent({ cwd: invocation.cwd, sessionFile, prompt, route: invocation.route });
+      await runAgent({ cwd: invocation.cwd, sessionFile, prompt, route: invocation.route, staleToolTimeoutMs: budget.staleMs });
       stopHeartbeat();
       if (invocation.telemetryRoot) await markTiming(invocation.telemetryRoot, `${invocation.role}AgentMs`, Date.now() - startedMs);
       const result = await readCanonicalBatchResult(resultFile);
@@ -37,7 +37,10 @@ export async function runSubagent(invocation: SubagentInvocation): Promise<Batch
       lastError = error;
       await emitTelemetry(invocation, sessionFile, startedMs, startedAt, attempt, budget, attempt <= maxRetries ? "retrying" : "failed", undefined, error);
       await appendSubagentEvent(invocation.cwd, invocation.id, { type: attempt <= maxRetries ? "agent_attempt_retry" : "agent_attempt_failed", role: invocation.role, attempt, error: String(error instanceof Error ? error.message : error) });
-      if (attempt > maxRetries) throw error;
+      if (attempt > maxRetries) {
+        if (isRecoverableAgentTimeout(error)) return await writeSyntheticFailureResult(invocation, error);
+        throw error;
+      }
     }
   }
   throw lastError instanceof Error ? lastError : new Error(String(lastError ?? "Subagent failed"));
@@ -71,6 +74,39 @@ async function emitTelemetry(invocation: SubagentInvocation, sessionFile: string
   if (error) telemetry.warnings.push(`AGENT_ERROR:${String(error instanceof Error ? error.message : error).slice(0, 200)}`);
   await writeSubagentTelemetry(invocation.cwd, telemetry);
   return telemetry;
+}
+
+function isRecoverableAgentTimeout(error: unknown): boolean {
+  const message = String(error instanceof Error ? error.message : error);
+  return /^AGENT_(?:STALE_TOOL_TIMEOUT|TIMEOUT):/.test(message);
+}
+
+async function writeSyntheticFailureResult(invocation: SubagentInvocation, error: unknown): Promise<BatchResult> {
+  const message = String(error instanceof Error ? error.message : error);
+  const failureType = message.startsWith("AGENT_STALE_TOOL_TIMEOUT:") ? "AGENT_STALE_TOOL_TIMEOUT" : "AGENT_TIMEOUT";
+  const batch = extractBatch(invocation.id);
+  const result: BatchResult = {
+    schemaVersion: 1,
+    agent: invocation.role,
+    batch,
+    status: "FAILURE",
+    itemsCompleted: [],
+    filesChanged: [`${invocation.outputBase}.md`, `${invocation.outputBase}.json`],
+    tests: {
+      regression: { command: "not applicable", exitCode: 1, evidence: message }
+    },
+    wiring: { required: false, entrypoints: [] },
+    projectLocalChecks: { evaluated: 0, triggered: [], notes: "agent did not complete" },
+    artifacts: [{ path: `${invocation.outputBase}.md`, description: "synthetic failure report" }],
+    localOnlyFiles: [],
+    inbox: { handledTitles: [] },
+    failureType,
+    flags: [failureType],
+    commit: null
+  };
+  await writeText(path.join(invocation.cwd, `${invocation.outputBase}.md`), `# ${failureType}\n\n${message}\n`);
+  await writeText(path.join(invocation.cwd, `${invocation.outputBase}.json`), JSON.stringify(result, null, 2) + "\n");
+  return result;
 }
 
 function formatDuration(ms: number): string {
@@ -218,6 +254,7 @@ You MUST write both output files before finishing:
 - Do NOT put plain strings in test evidence, e.g. \`"red": "passed"\`. Every test evidence object needs \`command\`, \`exitCode\`, and \`evidence\`.
 - Do NOT write descriptive labels as runnable commands. If live E2E required several shell steps, put an exact executable script/command in \`command\` or use \`command: "not applicable"\` and put artifact details in \`evidence\` and \`artifacts\`.
 - Do NOT claim a commit hash. Always write \`commit: null\`; the runtime owns commits.
+- Do NOT edit, recreate, delete, or list protected coordination/template-managed paths as deliverables: \`.agent/rules/\`, \`.agent/workflows/\`, \`.agent/guides/\`, \`.agent/agents/\`, \`AGENTS.md\`, \`CLAUDE.md\`, \`.cursorrules\`, \`.yolo/runtime.config.json\`, \`.yolo/runtime-state.json\`, runtime logs/events/worktrees, or secret files (\`.env*\`, \`*.pem\`, \`*.key\`). Support/refactor/audit batches must report blockers instead of touching these paths.
 - If Active Project-Local Checks are present, report how many were evaluated and any triggered checks.
 - If the PRD calls for mobile, offline/PWA, privacy/consent, or bundle discipline, include objective evidence and flags such as MOBILE_VIEWPORT_PASS, OFFLINE_PWA_PASS, PRIVACY_MATRIX_PASS, and BUNDLE_DYNAMIC_IMPORT_AUDIT_PASS when those concerns are touched.`;
 }

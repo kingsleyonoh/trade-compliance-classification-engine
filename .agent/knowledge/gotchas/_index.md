@@ -6,6 +6,7 @@
 
 | File | Summary |
 |------|---------|
+| `2026-05-24-windows-setup-exe-uac.md` | Windows UAC treats Rust `setup.exe` as an installer unless an asInvoker manifest is embedded. |
 | `EXAMPLE.md` | Template showing the expected shape — delete once a real gotcha exists. |
 
 ## How to add a new gotcha

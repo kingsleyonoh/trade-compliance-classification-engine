@@ -1,4 +1,4 @@
-# {{PROJECT_NAME}} — Coding Standards: Testing (Core TDD)
+# Trade Compliance Classification Engine — Coding Standards: Testing (Core TDD)
 
 > Part 3 of 7. Also loaded: `CODING_STANDARDS.md`, `CODING_STANDARDS_META.md`, `CODING_STANDARDS_TESTING_LOGIC.md`, `CODING_STANDARDS_TESTING_LIVE.md`, `CODING_STANDARDS_TESTING_E2E.md`, `CODING_STANDARDS_DOMAIN.md`
 > This file covers core TDD discipline and test quality. For business logic correctness, edge cases, multi-tenant fixtures, and test modularity → see `CODING_STANDARDS_TESTING_LOGIC.md`. For mock policy, integration, component, and E2E testing → see `CODING_STANDARDS_TESTING_LIVE.md` and `CODING_STANDARDS_TESTING_E2E.md`.

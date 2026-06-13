@@ -2,6 +2,7 @@ import { readdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { exists } from "./util/fs.js";
 import { git } from "./util/git.js";
+import { cleanupBatchDockerResources } from "./docker-cleanup.js";
 
 export interface PruneOptions {
   keepSuccessfulWorktrees: number;
@@ -48,6 +49,7 @@ async function isSuccessfulBatch(cwd: string, batch: string): Promise<boolean> {
 }
 
 async function removeWorktree(cwd: string, batch: string): Promise<boolean> {
+  await cleanupBatchDockerResources(cwd, Number(batch), "success");
   const rel = `.yolo/worktrees/batch-${batch}`;
   if (await exists(join(cwd, rel))) await tryGit(cwd, `worktree remove ${rel} --force`);
   await tryGit(cwd, `branch -D yolo/batch-${batch}`);

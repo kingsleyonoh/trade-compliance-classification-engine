@@ -38,7 +38,7 @@ function assertBlocked(path: string): void {
 function assertProtected(path: string): void {
   const result = validatePaths([path], defaultConfig);
   assert.equal(result.passed, false, `${path} should be protected`);
-  assert.ok(result.flags.some((flag) => flag.startsWith("PROTECTED_PATH")), `${path} should produce PROTECTED_PATH`);
+  assert.ok(result.flags.some((flag) => flag.startsWith("TEMPLATE_MANAGED_PROTECTED_PATH")), `${path} should produce TEMPLATE_MANAGED_PROTECTED_PATH`);
 }
 
 function assertNoLiveProjectOverfitStrings(): void {

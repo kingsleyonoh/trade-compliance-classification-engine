@@ -18,12 +18,22 @@ export async function validateWiring(cwd: string, batch: Batch, result: BatchRes
   if (!result.wiring?.entrypoints?.length) flags.push("NO_REACHABLE_ENTRYPOINTS");
   for (const rawEntry of result.wiring?.entrypoints ?? []) {
     const entry = normalizeEntrypoint(rawEntry);
-    const verifiedBy = entry.verifiedBy || inferVerifierEvidence(cwd, entry.path);
+    let verifiedBy = entry.verifiedBy;
+    let verifierFiles = extractVerifierFiles(verifiedBy);
+    if (!verifiedBy || verifierFiles.length === 0) {
+      const inferred = inferVerifierEvidence(cwd, entry.path, verifiedBy);
+      if (inferred) {
+        verifiedBy = inferred;
+        verifierFiles = extractVerifierFiles(verifiedBy);
+      }
+    }
     if (!verifiedBy) {
       flags.push(`ENTRYPOINT_UNVERIFIED:${entry.path}`);
       continue;
     }
-    for (const verifier of extractVerifierFiles(verifiedBy)) {
+    if (entry.verifiedBy && verifierFiles.length === 0) flags.push(`ENTRYPOINT_VERIFIER_PROSE_ONLY:${entry.path}`);
+    if (verifierFiles.length > 0 && verifierFiles.every(isImplementationOnlyVerifier)) flags.push(`ENTRYPOINT_VERIFIER_IMPLEMENTATION_ONLY:${entry.path}`);
+    for (const verifier of verifierFiles) {
       if (!(await verifierExists(cwd, verifier))) flags.push(`WIRING_VERIFIER_FILE_MISSING:${verifier}`);
     }
   }
@@ -46,9 +56,10 @@ function normalizeEntrypoint(entry: { type?: string; path?: string; verifiedBy?:
   return { path: String(entry.path ?? entry.type ?? "unknown"), verifiedBy: String(entry.verifiedBy ?? "") };
 }
 
-function inferVerifierEvidence(cwd: string, entrypoint: string): string {
+function inferVerifierEvidence(cwd: string, entrypoint: string, verifierHint = ""): string {
   const needles = verifierNeedles(entrypoint);
   if (!needles.length) return "";
+  const hintNeedles = verifierHintNeedles(verifierHint);
   const matches: string[] = [];
   for (const file of collectVerifierCandidates(cwd)) {
     let text = "";
@@ -57,7 +68,10 @@ function inferVerifierEvidence(cwd: string, entrypoint: string): string {
     } catch {
       continue;
     }
-    if (needles.some((needle) => typeof needle === "string" ? text.includes(needle) : needle.test(text))) matches.push(file);
+    const haystack = `${file}\n${text}`;
+    const provesEntrypoint = needles.some((needle) => typeof needle === "string" ? haystack.includes(needle) : needle.test(haystack));
+    const matchesVerifierHint = hintNeedles.length === 0 || hintNeedles.some((needle) => needle.test(haystack));
+    if (provesEntrypoint && matchesVerifierHint) matches.push(file);
     if (matches.length >= 3) break;
   }
   return matches.join(", ");
@@ -65,17 +79,26 @@ function inferVerifierEvidence(cwd: string, entrypoint: string): string {
 
 function verifierNeedles(entrypoint: string): Array<string | RegExp> {
   const value = entrypoint.trim();
-  const withoutMethod = value.replace(/^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+/i, "");
+  const primary = primaryEntrypointSegment(value);
+  const withoutMethod = primary.replace(/^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+/i, "");
   const needles: Array<string | RegExp> = [];
   if (withoutMethod.startsWith("/")) {
-    needles.push(withoutMethod);
-    const [pathOnly, query] = withoutMethod.split("?", 2);
+    const routeOnly = apiRouteOnly(withoutMethod);
+    needles.push(routeOnly);
+    const [pathOnly, query] = routeOnly.split("?", 2);
+    const pathPattern = dynamicPathPattern(pathOnly);
     if (query) {
-      needles.push(new RegExp(`${escapeRegex(pathOnly)}[\\s\\S]{0,160}${queryNeedle(query)}`, "i"));
+      needles.push(new RegExp(`${pathPattern}[\\s\\S]{0,240}${queryNeedle(query)}`, "i"));
     }
-    if (withoutMethod.includes(":")) needles.push(new RegExp(escapeRegex(withoutMethod).replace(/:[A-Za-z0-9_]+/g, "[^/'\"`]+")));
+    if (pathOnly.includes(":")) needles.push(new RegExp(pathPattern));
   }
   if (isCliEntrypoint(value)) {
+    const npmScript = npmRunScript(value);
+    if (npmScript) {
+      needles.push(npmScript, new RegExp(npmScript.replace(/[^A-Za-z0-9]+/g, "[\\s\\S]{0,80}"), "i"));
+      const scriptFileHint = npmScript.replace(/^test:/i, "run-").replace(/:/g, "-");
+      if (scriptFileHint !== npmScript) needles.push(scriptFileHint);
+    }
     for (const group of cliTokenGroups(value)) {
       if (group.length) needles.push(new RegExp(group.map(escapeRegex).join("[\\s\\S]{0,160}"), "i"));
     }
@@ -83,7 +106,7 @@ function verifierNeedles(entrypoint: string): Array<string | RegExp> {
   const normalized = withoutMethod.replace(/\\/g, "/");
   if (!withoutMethod.startsWith("/") && !isCliEntrypoint(value)) {
     const symbolGroups = symbolTokenGroups(normalized);
-    for (const group of symbolGroups) if (group.length) needles.push(new RegExp(group.map(escapeRegex).join("[\\s\\S]{0,160}"), "i"));
+    for (const group of symbolGroups) if (group.length) needles.push(new RegExp(group.map(symbolTokenPattern).join("[\\s\\S]{0,160}"), "i"));
   }
   if (/\.[A-Za-z0-9]+$/.test(normalized)) {
     needles.push(normalized);
@@ -99,33 +122,68 @@ function verifierNeedles(entrypoint: string): Array<string | RegExp> {
   });
 }
 
+function primaryEntrypointSegment(value: string): string {
+  return value.split(/\s+->\s+/)[0]?.trim() || value;
+}
+
+function apiRouteOnly(value: string): string {
+  return value.split(/\s+/)[0]?.trim() || value;
+}
+
 function symbolTokenGroups(value: string): string[][] {
+  const groups: string[][] = [];
+  for (const part of value.split("/")) {
+    const tokens = part.split(/[^A-Za-z0-9_!]+/).map((token) => token.trim()).filter((token) => token.length >= 3).filter(isUsefulSymbolToken);
+    if (tokens.length) groups.push(tokens);
+    if (tokens.length >= 2) groups.push(tokens.slice(-2));
+  }
+  return groups;
+}
+
+function verifierHintNeedles(value: string): RegExp[] {
   return value
-    .split("/")
-    .map((part) => part.split(/[^A-Za-z0-9_!]+/).map((token) => token.trim()).filter((token) => token.length >= 3));
+    .split(/[\s,;]+/)
+    .map((part) => part.replace(/^[\'"`(]+|[\'"`),.;:]+$/g, "").trim())
+    .filter((part) => part.length >= 3 && !/[\\/]/.test(part))
+    .map((part) => new RegExp(escapeRegex(part), "i"));
+}
+
+function isUsefulSymbolToken(token: string): boolean {
+  return !/^(returns?|without|server|error|log|logs|closes?|singleton|probe|validation|payload|invalid|fastify)$/i.test(token);
 }
 
 function isCliEntrypoint(value: string): boolean {
-  return /^CLI\s+/i.test(value) || /(?:^|\s)(?:[\w.-]+-)?(?:cli|portal|cmd|command)(?:\s|$)/i.test(value) || /(?:^|\s)--[A-Za-z0-9-]+/.test(value);
+  return /^CLI\s+/i.test(value) || /^npm\s+run\s+/i.test(value) || /(?:^|\s)(?:[\w.-]+-)?(?:cli|portal|cmd|command)(?:\s|$)/i.test(value) || /(?:^|\s)--[A-Za-z0-9-]+/.test(value);
+}
+
+function npmRunScript(value: string): string {
+  const match = /^npm\s+run\s+([^\s]+)/i.exec(value.trim());
+  return match?.[1] ?? "";
 }
 
 function cliTokenGroups(value: string): string[][] {
   const cleaned = value.replace(/^CLI\s+/i, "");
-  return cleaned.split("|").map((part) => part.split(/\s+/).map((token) => token.trim()).filter(Boolean).filter((token) => !/^<.+>$/.test(token) && !/^(?:[\w.-]+-)?(?:cli|portal|cmd|command)$/i.test(token)));
+  return cleaned.split("|").map((part) => part.split(/\s+/).map((token) => token.trim()).filter(Boolean).filter((token) => !/^<.+>$/.test(token) && !/^(?:npm|run|[\w.-]+-)?(?:cli|portal|cmd|command)$/i.test(token)));
+}
+
+function dynamicPathPattern(path: string): string {
+  return escapeRegex(path).replace(/:[A-Za-z0-9_]+/g, "[^/'\"`?&\\s]+")
 }
 
 function queryNeedle(query: string): string {
   return query.split("&").filter(Boolean).map((part) => {
     const [key, value = ""] = part.split("=", 2);
-    return `${escapeRegex(key)}[\\s\\S]{0,40}${escapeRegex(value)}`;
+    const keyPattern = escapeRegex(key);
+    if (!value || /^<[^>]+>$/.test(value) || /^:[A-Za-z0-9_]+$/.test(value)) return keyPattern;
+    return `${keyPattern}[\\s\\S]{0,40}${escapeRegex(value)}`;
   }).join("[\\s\\S]{0,80}");
 }
 
 function collectVerifierCandidates(cwd: string): string[] {
-  const roots = ["tests", "test", "spec", "src", "scripts", "tools"];
+  const roots = ["tests", "test", "spec", "src/test", "scripts", "tools"];
   const files: string[] = [];
   for (const root of roots) collectFiles(cwd, root, files);
-  return files.filter((file) => /(?:test|spec|__tests__|tests[\/])|src[\/]|scripts[\/]|tools[\/]/i.test(file));
+  return files.filter((file) => /(?:test|spec|__tests__|tests[\/])|scripts[\/]|tools[\/]/i.test(file));
 }
 
 function collectFiles(cwd: string, relDir: string, files: string[]): void {
@@ -179,6 +237,15 @@ function fileExtension(file: string): string {
 function isTestLikePath(file: string): boolean {
   const name = file.split("/").pop() ?? file;
   return /(?:^|[._-])(test|spec)(?:[._-]|$)/i.test(name) || /(?:Test|Spec)\.[A-Za-z0-9]+$/.test(name) || /_test\.[A-Za-z0-9]+$/i.test(name);
+}
+
+function isImplementationOnlyVerifier(file: string): boolean {
+  const normalized = file.replace(/\\/g, "/").replace(/^\.\//, "");
+  return /(?:^|\/)src\//i.test(normalized) && !isTestLikePath(normalized) && !/(?:^|\/)(?:tests?|spec|__tests__)\//i.test(normalized);
+}
+
+function symbolTokenPattern(value: string): string {
+  return `(?<![A-Za-z0-9_])${escapeRegex(value)}(?![A-Za-z0-9_])`;
 }
 
 function escapeRegex(value: string): string {

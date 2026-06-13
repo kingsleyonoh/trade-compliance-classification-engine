@@ -1,0 +1,13 @@
+target/
+.git/
+.github/
+.env
+.env.*
+!.env.example
+.yolo/worktrees/
+.yolo/pi-sessions/
+tools/klevar-yolo-runtime/node_modules/
+tools/klevar-yolo-runtime/dist/
+node_modules/
+playwright-report/
+test-results/

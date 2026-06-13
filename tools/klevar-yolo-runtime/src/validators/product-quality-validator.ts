@@ -29,9 +29,10 @@ export async function validateProductQuality(cwd: string, batch: Batch, result: 
   warnings.push(...design.warnings);
 
   for (const rule of QUALITY_RULES) {
+    const requiredByContract = contractRequires(contract, rule.flag, rule.trigger);
     const has = hasEvidence(result, evidence, rule.flag, rule.evidence);
-    if (has) continue;
-    if (contractRequires(contract, rule.flag, rule.trigger)) flags.push(rule.missing);
+    if (has || (!requiredByContract && hasNotApplicableFlag(result, rule.flag))) continue;
+    if (requiredByContract) flags.push(rule.missing);
     else if (!contract && frontendRelevantSentence(prd, rule.trigger)) warnings.push(`QUALITY_WARNING:${rule.missing}`);
   }
 
@@ -58,11 +59,20 @@ function isGenericDesignBrief(text: string): boolean {
 }
 
 function hasEvidence(result: BatchResult, text: string, flag: string, pattern: RegExp): boolean {
-  return result.flags.some((item) => item === flag || item.startsWith(`${flag}:`) || evidenceVariantFlags(flag).some((variant) => item === variant || item.startsWith(`${variant}:`))) || pattern.test(text);
+  return result.flags.some((item) => item === flag || item.startsWith(`${flag}:`) || evidenceVariantFlags(flag).some((variant) => item === variant || item.startsWith(`${variant}:`))) || positiveEvidencePattern(pattern).test(text);
+}
+
+function hasNotApplicableFlag(result: BatchResult, flag: string): boolean {
+  const variant = flag.replace(/_PASS$/, "_NOT_APPLICABLE");
+  return result.flags.some((item) => item === variant || item.startsWith(`${variant}:`));
+}
+
+function positiveEvidencePattern(pattern: RegExp): RegExp {
+  return new RegExp(`(?<!\\bno\\s)(?<!\\bnot\\s)(?<!\\bmissing\\s)(?:${pattern.source})`, pattern.flags.includes("i") ? "i" : undefined);
 }
 
 function evidenceVariantFlags(flag: string): string[] {
-  return [flag.replace(/_PASS$/, "_NOT_APPLICABLE"), flag.replace(/_PASS$/, "_EVIDENCE_RECORDED")];
+  return [flag.replace(/_PASS$/, "_EVIDENCE_RECORDED")];
 }
 
 function contractRequires(contract: string, flag: string, trigger: RegExp): boolean {
@@ -96,7 +106,6 @@ function headingLevel(line: string): number {
 
 function evidenceText(result: BatchResult): string {
   return [
-    ...(result.flags ?? []),
     result.businessLogic?.rule,
     result.businessLogic?.sourceOfTruth,
     result.businessLogic?.test,
@@ -125,10 +134,11 @@ function isTestOrDocPath(file: string): boolean {
 
 async function readProductSpec(cwd: string): Promise<string> {
   const docsDir = path.join(cwd, "docs");
-  const candidates = ["docs/PRD.md", "docs/prd.md", "PRD.md", "docs/PRD_TEMPLATE.md"];
+  const candidates = ["docs/PRD.md", "docs/prd.md", "PRD.md"];
   try {
     const { readdir } = await import("node:fs/promises");
-    if (await exists(docsDir)) candidates.push(...(await readdir(docsDir)).filter((name) => /prd.*\.md$|.*_prd\.md$/i.test(name)).map((name) => `docs/${name}`));
+    if (await exists(docsDir)) candidates.push(...(await readdir(docsDir)).filter((name) => /prd.*\.md$|.*_prd\.md$/i.test(name) && name !== "PRD_TEMPLATE.md").map((name) => `docs/${name}`));
+    candidates.push("docs/PRD_TEMPLATE.md");
   } catch {
     // ignore dynamic discovery failures
   }

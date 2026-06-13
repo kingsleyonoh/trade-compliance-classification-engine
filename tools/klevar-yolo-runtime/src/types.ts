@@ -29,7 +29,13 @@ export interface ModelRoute {
 export interface RuntimeConfig {
   schemaVersion: number;
   maxBatchSize: number;
+  validationMode?: "safe" | "balanced" | "fast";
   reinforcementThreshold: number;
+  speed?: {
+    deterministicJournal?: boolean;
+    observeRisk?: boolean;
+    observeAffectedTests?: boolean;
+  };
   worktrees: { enabled: boolean; keepOnFailure: boolean };
   retention: { keepSuccessfulWorktrees: number; keepFailedWorktrees: boolean };
   policy: { blockedPaths: string[]; protectedPaths: string[]; allowedGeneratedPaths: string[]; localOnlyPaths: string[]; allowExternalMutations?: boolean };
@@ -37,6 +43,15 @@ export interface RuntimeConfig {
   recovery?: {
     maxBugfixAttempts: number;
     retryJournalOnce: boolean;
+    selfHealRuntime?: boolean;
+    maxSelfHealAttempts?: number;
+    repairUnreadableRuntimeState?: boolean;
+  };
+  docker?: {
+    enabled: boolean;
+    cleanupBatchResources: boolean;
+    removeVolumesOnSuccess: boolean;
+    removeVolumesOnFailure: boolean;
   };
   collaboration?: {
     enabled: boolean;
@@ -100,6 +115,7 @@ export interface TestEvidence {
 }
 
 export interface BatchResult {
+  [key: string]: unknown;
   schemaVersion: number;
   agent: AgentRole;
   batch: number;

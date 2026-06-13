@@ -6,7 +6,13 @@
 
 | File | Summary |
 |------|---------|
+| `api-error-envelope.md` | Shared `ApiError` response envelope for API and HTMX errors. |
+| `cached-helper.md` | Shared lazy cache primitive for expensive helper outputs. |
+| `core-config-loading.md` | AppConfig env loading, defaults, and optional-adapter disabled-by-default contract. |
+| `db-pool-bootstrap.md` | Database pool configuration derived from `AppConfig` and validated before connecting. |
 | `EXAMPLE.md` | Template showing the expected shape — delete once a real foundation primitive exists. |
+| `telemetry-metrics.md` | Shared tracing initialization, request IDs, and tenant-scoped counters. |
+| `tenant-auth-context.md` | Tenant context extraction and role/action policy foundation. |
 
 ## What belongs here
 

@@ -1,4 +1,4 @@
-# {{PROJECT_NAME}} — Coding Standards: Testing Logic & Correctness
+# Trade Compliance Classification Engine — Coding Standards: Testing Logic & Correctness
 
 > Part 4 of 7. Also loaded: `CODING_STANDARDS.md` (core AI discipline), `CODING_STANDARDS_META.md` (skills, env, branching), `CODING_STANDARDS_TESTING.md` (core TDD and test quality), `CODING_STANDARDS_TESTING_LIVE.md` (mock policy + component + backend integration), `CODING_STANDARDS_TESTING_E2E.md` (E2E), `CODING_STANDARDS_DOMAIN.md` (deploy/security)
 > This file covers business logic correctness, edge cases, modularity, multi-tenant fixtures, and business-context testing.

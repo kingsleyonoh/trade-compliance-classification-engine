@@ -1,0 +1,5 @@
+{
+  "kind": "worktree-sync",
+  "candidatePaths": ["src/jobs/scheduler.ts"],
+  "expectedErrorIncludes": "WORKTREE_CHANGED_FILES_UNDECLARED:src/jobs/worker.ts"
+}

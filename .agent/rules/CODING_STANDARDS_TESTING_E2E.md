@@ -1,4 +1,4 @@
-# {{PROJECT_NAME}} — Coding Standards: E2E Testing (Real Endpoints)
+# Trade Compliance Classification Engine — Coding Standards: E2E Testing (Real Endpoints)
 
 > Part 5 of 5. Also loaded: `CODING_STANDARDS.md` (core AI discipline), `CODING_STANDARDS_META.md` (skills, env, branching), `CODING_STANDARDS_TESTING.md` (core TDD), `CODING_STANDARDS_TESTING_LIVE.md` (mock policy + component + in-process backend integration), `CODING_STANDARDS_DOMAIN.md` (deploy/security)
 > This file covers end-to-end testing that hits a running server via real HTTP. In-process testing (supertest, inject, test clients) lives in `CODING_STANDARDS_TESTING_LIVE.md`.

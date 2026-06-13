@@ -1,0 +1,92 @@
+openapi: 3.1.0
+info:
+  title: Trade Compliance Classification Engine API
+  version: 0.1.0
+paths:
+  /health:
+    get:
+      summary: Process health
+      responses: { '200': { description: OK } }
+  /health/db:
+    get:
+      summary: Database health
+      responses: { '200': { description: OK } }
+  /health/ready:
+    get:
+      summary: Readiness for traffic
+      responses: { '200': { description: OK } }
+  /api/tenants/register:
+    post:
+      summary: Register tenant
+      responses: { '200': { description: Tenant registered } }
+  /tenants/me:
+    get:
+      summary: Current tenant/user profile
+      responses: { '200': { description: Profile } }
+  /api/products/import:
+    post:
+      summary: Import CSV/JSON catalog
+      responses: { '200': { description: Import report } }
+  /api/products:
+    get:
+      summary: List products
+      responses: { '200': { description: Product list } }
+  /api/products/{id}:
+    get:
+      summary: Product detail
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: Product } }
+  /api/classifications/run:
+    post:
+      summary: Queue classification for products
+      responses: { '202': { description: Queued } }
+  /api/classifications:
+    get:
+      summary: List classification runs
+      responses: { '200': { description: Runs } }
+  /api/classifications/{id}:
+    get:
+      summary: Classification detail
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: Run } }
+  /api/classifications/{id}/override:
+    post:
+      summary: Create reviewer override
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '201': { description: Override created } }
+  /api/rule-packs:
+    post:
+      summary: Upload rule pack
+      responses: { '201': { description: Rule pack created } }
+  /api/rule-packs/{id}/validate:
+    post:
+      summary: Validate rule pack
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: Validation report } }
+  /api/rule-packs/{id}/activate:
+    post:
+      summary: Activate passing rule pack
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: Activated } }
+  /api/audit-exports:
+    post:
+      summary: Queue audit export
+      responses: { '202': { description: Queued } }
+  /api/audit-exports/{id}/download:
+    get:
+      summary: Download audit export
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: File } }
+  /api/integrations:
+    get:
+      summary: List adapter status
+      responses: { '200': { description: Integrations } }
+  /api/integrations/{provider}:
+    put:
+      summary: Configure adapter
+      parameters: [{ name: provider, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: Updated } }
+  /api/backtests/run:
+    post:
+      summary: Run evaluation harness
+      responses: { '202': { description: Backtest queued } }

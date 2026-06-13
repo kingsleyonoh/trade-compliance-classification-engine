@@ -3,8 +3,9 @@ import { readFile } from "node:fs/promises";
 import { ensureDir, exists, writeText } from "./util/fs.js";
 import { notifyRuntimeFinish } from "./notifications.js";
 import type { GateResult } from "./types.js";
+import { runtimeVersionProof, type RuntimeVersionProof } from "./runtime-metadata.js";
 
-export type RuntimePhase = "idle" | "select" | "worktree" | "knowledge" | "implement" | "validate" | "bugfix" | "journal" | "merge" | "commit" | "failed" | "complete";
+export type RuntimePhase = "idle" | "select" | "worktree" | "knowledge" | "implement" | "validate" | "bugfix" | "journal" | "merge" | "cleanup" | "commit" | "failed" | "complete";
 
 export interface RuntimeState {
   schemaVersion: 1;
@@ -19,7 +20,16 @@ export interface RuntimeState {
   gates: Record<string, "pending" | "running" | "passed" | "failed" | "skipped">;
   timings: Record<string, number | null>;
   inspect: Record<string, string>;
+  speed?: {
+    validators?: Record<string, { status: "started" | "passed" | "failed" | "skipped"; durationMs?: number; reason?: string }>;
+    commands?: Array<{ phase: string; command: string; provenance: string; status: "hit" | "miss" | "adopted" | "rejected" | "recorded"; reason?: string; durationMs?: number; at: string }>;
+    journalDecisions?: Array<{ batch: number; decision: "fast_path_used" | "fallback" | "reused_existing"; reason?: string; at: string }>;
+    riskObservations?: Array<{ batch: number; class: string; reasons: string[]; observedOnly: true; at: string }>;
+    affectedTestPlans?: Array<{ batch: number; confidence: string; files: string[]; candidateCommands: string[]; rejected: Array<{ path: string; reason: string }>; observedOnly: true; at: string }>;
+  };
+  recovery?: { attempts: Array<{ phase: string; kind: string; healed: boolean; actions: string[]; at: string }> };
   checkpoints?: Record<string, "pending" | "running" | "passed" | "failed" | "skipped">;
+  runtimeMetadata?: RuntimeVersionProof;
 }
 
 export async function resetRuntimeState(cwd: string, batch: number, requestedScope = "unknown", support?: { kind?: string; scope?: string }): Promise<void> {
@@ -36,19 +46,21 @@ export async function resetRuntimeState(cwd: string, batch: number, requestedSco
     gates: defaultGates(),
     timings: {},
     inspect: { requestedScope, ...(support?.kind ? { supportKind: support.kind } : {}), ...(support?.scope ? { supportScope: support.scope } : {}) },
-    checkpoints: defaultCheckpoints()
+    checkpoints: defaultCheckpoints(),
+    runtimeMetadata: await runtimeVersionProof(cwd)
   });
+  await appendEvent(cwd, { type: "runtime_version_proof", batch, ...(await runtimeVersionProof(cwd)) });
   await appendEvent(cwd, { type: "batch_selected", batch });
 }
 
 export async function setPhase(cwd: string, phase: RuntimePhase, message: string, extra: Partial<RuntimeState> = {}): Promise<void> {
-  const runningPhases: RuntimePhase[] = ["select", "worktree", "knowledge", "implement", "validate", "bugfix", "journal", "merge", "commit"];
+  const runningPhases: RuntimePhase[] = ["select", "worktree", "knowledge", "implement", "validate", "bugfix", "journal", "merge", "cleanup", "commit"];
   const status = runningPhases.includes(phase) ? "running" : phase === "complete" ? "complete" : phase === "failed" ? "failed" : undefined;
   const state = await readState(cwd);
   const checkpoint = checkpointForPhase(phase);
   const checkpointStatus: "failed" | "running" | "passed" = phase === "failed" ? "failed" : phase === "complete" ? "passed" : "running";
   const checkpoints = checkpoint ? { ...defaultCheckpoints(), ...(state.checkpoints ?? {}), [checkpoint]: checkpointStatus } : state.checkpoints;
-  await patchState(cwd, { ...(status ? { status } : {}), ...(checkpoints ? { checkpoints } : {}), phase, lastEvent: message, ...extra });
+  await patchState(cwd, { ...(status ? { status } : {}), ...(checkpoints ? { checkpoints } : {}), phase, lastEvent: message, ...extra, ...(extra.inspect ? { inspect: { ...(state.inspect ?? {}), ...extra.inspect } } : {}) });
   await appendEvent(cwd, { type: "phase", phase, message });
 }
 
@@ -73,14 +85,64 @@ export async function setGates(cwd: string, gates: GateResult[]): Promise<void> 
 
 export async function markHeartbeat(cwd: string, message: string): Promise<void> {
   const state = await readState(cwd);
-  const repairedPhase = state.phase === "failed" ? phaseFromHeartbeat(message) : undefined;
-  await patchState(cwd, { status: "running", ...(repairedPhase ? { phase: repairedPhase } : {}), lastEvent: message });
+  if (state.status !== "running") {
+    await patchState(cwd, { lastEvent: message });
+    return;
+  }
+  await patchState(cwd, { status: "running", lastEvent: message });
 }
 
 export async function markCommand(cwd: string, phase: string, command: string, status: "started" | "passed" | "failed", durationMs?: number): Promise<void> {
   const label = `${phase}: ${command}`;
   await patchState(cwd, { lastEvent: `${status.toUpperCase()} ${label}` });
   await appendEvent(cwd, { type: `command_${status}`, phase, command, durationMs });
+}
+
+export async function markCommandDecision(cwd: string, phase: string, command: string, provenance: string, status: "hit" | "miss" | "adopted" | "rejected" | "recorded", reason?: string, durationMs?: number): Promise<void> {
+  const state = await readState(cwd);
+  const event = { phase, command, provenance, status, reason, durationMs, at: new Date().toISOString() };
+  const commands = [...(state.speed?.commands ?? []), event].slice(-200);
+  await patchState(cwd, { speed: { ...(state.speed ?? {}), commands }, lastEvent: `COMMAND_${status.toUpperCase()} ${phase}: ${command}` });
+  await appendEvent(cwd, { type: "command_reuse_decision", ...event });
+}
+
+export async function markValidator(cwd: string, gate: string, status: "started" | "passed" | "failed" | "skipped", durationMs?: number, reason?: string): Promise<void> {
+  const state = await readState(cwd);
+  const validators = { ...(state.speed?.validators ?? {}), [gate]: { status, ...(durationMs !== undefined ? { durationMs } : {}), ...(reason ? { reason } : {}) } };
+  await patchState(cwd, { speed: { ...(state.speed ?? {}), validators }, lastEvent: `VALIDATOR_${status.toUpperCase()} ${gate}` });
+  await appendEvent(cwd, { type: `validator_${status}`, gate, durationMs, reason });
+}
+
+export async function markJournalDecision(cwd: string, batch: number, decision: "fast_path_used" | "fallback" | "reused_existing", reason?: string): Promise<void> {
+  const state = await readState(cwd);
+  const event = { batch, decision, reason, at: new Date().toISOString() };
+  const journalDecisions = [...(state.speed?.journalDecisions ?? []), event].slice(-100);
+  await patchState(cwd, { speed: { ...(state.speed ?? {}), journalDecisions }, lastEvent: `JOURNAL_${decision.toUpperCase()} batch-${String(batch).padStart(3, "0")}` });
+  await appendEvent(cwd, { type: "journal_decision", ...event });
+}
+
+export async function markRiskObservation(cwd: string, batch: number, observation: { class: string; reasons: string[]; observedOnly: true }): Promise<void> {
+  const state = await readState(cwd);
+  const event = { batch, ...observation, at: new Date().toISOString() };
+  const riskObservations = [...(state.speed?.riskObservations ?? []), event].slice(-100);
+  await patchState(cwd, { speed: { ...(state.speed ?? {}), riskObservations }, lastEvent: `RISK_OBSERVED ${observation.class}` });
+  await appendEvent(cwd, { type: "risk_observation", ...event });
+}
+
+export async function markAffectedTestPlan(cwd: string, batch: number, plan: { confidence: string; files: string[]; candidateCommands: string[]; rejected: Array<{ path: string; reason: string }>; observedOnly: true }): Promise<void> {
+  const state = await readState(cwd);
+  const event = { batch, ...plan, at: new Date().toISOString() };
+  const affectedTestPlans = [...(state.speed?.affectedTestPlans ?? []), event].slice(-100);
+  await patchState(cwd, { speed: { ...(state.speed ?? {}), affectedTestPlans }, lastEvent: `AFFECTED_TEST_PLAN ${plan.confidence}` });
+  await appendEvent(cwd, { type: "affected_test_plan", ...event });
+}
+
+export async function markSelfHeal(cwd: string, phase: string, kind: string, healed: boolean, actions: string[]): Promise<void> {
+  const state = await readState(cwd);
+  const event = { phase, kind, healed, actions, at: new Date().toISOString() };
+  const attempts = [...(state.recovery?.attempts ?? []), event].slice(-100);
+  await patchState(cwd, { recovery: { attempts }, lastEvent: `SELF_HEAL_${healed ? "HEALED" : "BLOCKED"} ${phase}:${kind}` });
+  await appendEvent(cwd, { type: "self_heal", ...event });
 }
 
 export async function markTiming(cwd: string, key: string, durationMs: number): Promise<void> {
@@ -115,7 +177,7 @@ async function readState(cwd: string): Promise<RuntimeState> {
 
 async function patchState(cwd: string, patch: Partial<RuntimeState>): Promise<void> {
   const current = await readState(cwd);
-  await writeState(cwd, { ...current, ...patch, updatedAt: new Date().toISOString() });
+  await writeState(cwd, { ...current, runtimeMetadata: current.runtimeMetadata ?? await runtimeVersionProof(cwd), ...patch, updatedAt: new Date().toISOString() });
 }
 
 async function writeState(cwd: string, state: RuntimeState): Promise<void> {
@@ -162,5 +224,5 @@ function checkpointForPhase(phase: RuntimePhase): string | null {
 }
 
 function defaultGates(): Record<string, "pending"> {
-  return { "progress-contract": "pending", "claims-contract": "pending", knowledge: "pending", contract: "pending", tdd: "pending", e2e: "pending", wiring: "pending", paths: "pending", "local-only": "pending", secrets: "pending", "command-rerun": "pending", "project-local-checks": "pending", "business-logic": "pending", frontend: "pending", quality: "pending", artifacts: "pending", parallel: "pending", journal: "pending", closeout: "pending" };
+  return { "progress-contract": "pending", "claims-contract": "pending", knowledge: "pending", contract: "pending", tdd: "pending", e2e: "pending", wiring: "pending", paths: "pending", "local-only": "pending", "external-ops": "pending", secrets: "pending", "command-rerun": "pending", "project-local-checks": "pending", "business-logic": "pending", frontend: "pending", quality: "pending", artifacts: "pending", parallel: "pending", journal: "pending", closeout: "pending" };
 }

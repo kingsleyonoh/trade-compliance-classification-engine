@@ -1,0 +1,54 @@
+{
+  "kind": "runtime-classification",
+  "batch": 103,
+  "implementation": {
+    "schemaVersion": 1,
+    "agent": "implement",
+    "batch": 103,
+    "status": "FAILURE",
+    "itemsCompleted": [],
+    "filesChanged": [
+      "src/domain/rules.ts",
+      ".yolo/runtime/batches/batch-103/state.json"
+    ],
+    "tests": {},
+    "failureType": "RUNTIME_POISONED_RECOVERY_LOOP",
+    "flags": [
+      "RUNTIME_POISONED_RECOVERY_LOOP",
+      "BUGFIX_RESULT_INVALID",
+      "BUSINESS_LOGIC_RULE_MISSING:domain-rule"
+    ],
+    "commit": null
+  },
+  "recovery": {
+    "schemaVersion": 1,
+    "agent": "bugfix",
+    "batch": 103,
+    "status": "SUCCESS",
+    "itemsCompleted": [],
+    "filesChanged": [
+      ".yolo/batch-results/batch-103-bugfix.json"
+    ],
+    "tests": {
+      "regression": {
+        "command": "npm test -- --poisoned-recovery",
+        "exitCode": 0,
+        "evidence": "poisoned exit detected"
+      }
+    },
+    "flags": [
+      "FIXED:RUNTIME_POISONED_RECOVERY_LOOP"
+    ],
+    "commit": null
+  },
+  "expectedClassification": "mixed",
+  "expectedActiveBlockers": [
+    "BUSINESS_LOGIC_RULE_MISSING:domain-rule"
+  ],
+  "expectedQuarantinedStaleFindings": [
+    "BUGFIX_RESULT_INVALID",
+    "RUNTIME_POISONED_RECOVERY_LOOP"
+  ],
+  "expectedRecommendationIncludes": "product blockers remain active",
+  "expectBugfixDispatch": false
+}

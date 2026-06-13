@@ -1,4 +1,4 @@
-# {{PROJECT_NAME}} — Coding Standards
+# Trade Compliance Classification Engine — Coding Standards
 
 > Part 1 of 5. Also loaded: `CODING_STANDARDS_META.md` (skills, env, git branching), `CODING_STANDARDS_TESTING.md` (core TDD), `CODING_STANDARDS_TESTING_LIVE.md` (mock policy + component + backend integration), `CODING_STANDARDS_TESTING_E2E.md` (E2E), `CODING_STANDARDS_DOMAIN.md` (deploy/security)
 

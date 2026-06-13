@@ -1,0 +1,50 @@
+{
+  "kind": "runtime-classification",
+  "batch": 102,
+  "implementation": {
+    "schemaVersion": 1,
+    "agent": "implement",
+    "batch": 102,
+    "status": "FAILURE",
+    "itemsCompleted": [],
+    "filesChanged": [
+      ".yolo/gates/support-batch-102.md"
+    ],
+    "tests": {},
+    "failureType": "PLAN_REJECTED",
+    "flags": [
+      "PLAN_REJECTED:.yolo/gates/support-batch-102.md",
+      "SUPPORT_LOOP_STALE:modularity-support"
+    ],
+    "commit": null
+  },
+  "recovery": {
+    "schemaVersion": 1,
+    "agent": "bugfix",
+    "batch": 102,
+    "status": "SUCCESS",
+    "itemsCompleted": [],
+    "filesChanged": [
+      ".yolo/gates/support-batch-102.md"
+    ],
+    "tests": {
+      "regression": {
+        "command": "npm test -- --support-scheduler",
+        "exitCode": 0,
+        "evidence": "support due marker reset"
+      }
+    },
+    "flags": [
+      "FIXED:PLAN_REJECTED:.yolo/gates/support-batch-102.md"
+    ],
+    "commit": null
+  },
+  "expectedClassification": "runtime-owned",
+  "expectedActiveBlockers": [],
+  "expectedQuarantinedStaleFindings": [
+    "PLAN_REJECTED",
+    "PLAN_REJECTED:.yolo/gates/support-batch-102.md"
+  ],
+  "expectedRecommendationIncludes": "do not dispatch bugfix",
+  "expectBugfixDispatch": false
+}

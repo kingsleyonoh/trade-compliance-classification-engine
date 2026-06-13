@@ -1,4 +1,4 @@
-# {{PROJECT_NAME}} — Coding Standards: Meta (Skills, Environment, Branching)
+# Trade Compliance Classification Engine — Coding Standards: Meta (Skills, Environment, Branching)
 
 > Part 2 of 5. Also loaded: `CODING_STANDARDS.md` (core AI discipline), `CODING_STANDARDS_TESTING.md` (core TDD), `CODING_STANDARDS_TESTING_LIVE.md` (mock policy + component + backend integration), `CODING_STANDARDS_TESTING_E2E.md` (E2E), `CODING_STANDARDS_DOMAIN.md` (deploy/security)
 > This file covers skill orchestration, shell environment, and git branching strategy. The main AI discipline rules live in `CODING_STANDARDS.md`.
