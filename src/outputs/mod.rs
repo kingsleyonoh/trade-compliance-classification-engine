@@ -45,6 +45,7 @@ pub async fn create_audit_export(
     run_id: Uuid,
     format: ExportFormat,
 ) -> Result<Value, ApiError> {
+    ensure_classification_export_ready(pool, tenant_id, run_id).await?;
     let snapshot = capture_audit_snapshot(pool, tenant_id, run_id).await?;
     let row = insert_export(pool, tenant_id, run_id, format, snapshot).await?;
     Ok(export_json(row))
@@ -76,6 +77,37 @@ pub async fn download_audit_export(
 ) -> Result<String, ApiError> {
     let format = fetch_export_format(pool, tenant_id, export_id).await?;
     export_audit_pack_from_snapshot(pool, tenant_id, export_id, ExportFormat::parse(&format)?).await
+}
+
+async fn ensure_classification_export_ready(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    run_id: Uuid,
+) -> Result<(), ApiError> {
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM classification_runs WHERE tenant_id=$1 AND id=$2")
+            .bind(tenant_id)
+            .bind(run_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(ApiError::from_sqlx)?
+            .ok_or_else(|| {
+                ApiError::not_found(
+                    "classification_not_found",
+                    "classification run was not found for this tenant",
+                )
+            })?;
+    if matches!(
+        status.as_str(),
+        "classified" | "needs_review" | "completed" | "blocked"
+    ) {
+        Ok(())
+    } else {
+        Err(ApiError::conflict(
+            "classification_not_complete",
+            "audit export requires a completed classification run",
+        ))
+    }
 }
 
 async fn insert_export(

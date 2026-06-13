@@ -64,3 +64,6 @@ AGENTS.md
 .claude/shell-snapshots/
 .claude/todos/
 .claude/statsig/
+
+# Pi local browser QA artifacts (screenshots, downloads, HAR, video, profiles)
+.pi/browser/

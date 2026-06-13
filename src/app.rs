@@ -153,13 +153,36 @@ fn audit_routes(router: Router<AppState>) -> Router<AppState> {
 
 fn ui_routes(router: Router<AppState>) -> Router<AppState> {
     router
+        .route("/ui/login", get(ui::login_page).post(ui::submit_login))
         .route("/ui/dashboard", get(ui::dashboard))
-        .route("/ui/products/import", get(ui::product_import))
+        .route(
+            "/ui/products/import",
+            get(ui::product_import).post(ui::submit_product_import),
+        )
         .route("/ui/products", get(ui::products))
-        .route("/ui/classifications/detail", get(ui::classification_detail))
-        .route("/ui/rule-packs", get(ui::rule_packs))
+        .route("/ui/classifications", get(ui::classifications))
+        .route("/ui/classifications/run", post(ui::submit_run_selected))
+        .route(
+            "/ui/classifications/detail",
+            get(ui::classification_detail_legacy),
+        )
+        .route("/ui/classifications/:id", get(ui::classification_detail))
+        .route(
+            "/ui/rule-packs",
+            get(ui::rule_packs).post(ui::submit_rule_pack),
+        )
+        .route("/ui/rule-packs/:id/validate", post(ui::validate_rule_pack))
+        .route("/ui/rule-packs/:id/activate", post(ui::activate_rule_pack))
         .route("/ui/reviews", get(ui::reviews))
-        .route("/ui/audit-exports", get(ui::audit_exports))
+        .route("/ui/reviews/:id/override", post(ui::submit_review_override))
+        .route(
+            "/ui/audit-exports",
+            get(ui::audit_exports).post(ui::submit_audit_export),
+        )
+        .route(
+            "/ui/audit-exports/:id/download",
+            get(ui::download_ui_audit_export),
+        )
         .route("/ui/integrations", get(ui::integrations))
 }
 

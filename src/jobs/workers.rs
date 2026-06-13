@@ -1,10 +1,86 @@
 pub use crate::classification::service::classify_queued_products;
 
+use std::time::Duration;
+
 use crate::config::{OptionalIntegrationConfig, WorkflowEngineConfig};
 use crate::errors::ApiError;
 use crate::integrations::health::{optional_health, workflow_health, AdapterHealth};
+use crate::jobs::lease::lease_classification_jobs;
 use crate::outputs::{export_audit_pack_from_snapshot, ExportFormat};
 use sqlx::{PgPool, Row};
+use tokio::{task::JoinHandle, time::MissedTickBehavior};
+
+#[derive(Debug, Clone)]
+pub struct ClassificationWorkerConfig {
+    pub worker_id: String,
+    pub batch_limit: i64,
+    pub lease_for: Duration,
+    pub interval: Duration,
+    pub audit_export_limit: i64,
+}
+
+impl Default for ClassificationWorkerConfig {
+    fn default() -> Self {
+        Self {
+            worker_id: "local-main-worker".to_owned(),
+            batch_limit: 25,
+            lease_for: Duration::from_secs(30),
+            interval: Duration::from_secs(1),
+            audit_export_limit: 10,
+        }
+    }
+}
+
+pub fn spawn_classification_worker_loop(
+    pool: PgPool,
+    config: ClassificationWorkerConfig,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(config.interval.max(Duration::from_millis(100)));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            if let Err(error) = run_worker_tick(&pool, &config).await {
+                tracing::warn!(error = ?error, worker_id = %config.worker_id, "classification worker tick failed");
+            }
+        }
+    })
+}
+
+async fn run_worker_tick(
+    pool: &PgPool,
+    config: &ClassificationWorkerConfig,
+) -> Result<(), ApiError> {
+    let leased = lease_classification_jobs(
+        pool,
+        &config.worker_id,
+        config.batch_limit,
+        config.lease_for,
+    )
+    .await
+    .map_err(ApiError::from_sqlx)?;
+    if !leased.is_empty() {
+        let report = classify_queued_products(pool, &config.worker_id, config.batch_limit)
+            .await
+            .map_err(ApiError::from_sqlx)?;
+        tracing::info!(
+            worker_id = %config.worker_id,
+            leased = leased.len(),
+            completed = report.completed,
+            failed = report.failed,
+            "processed queued classification jobs"
+        );
+    }
+    let rendered_exports = export_audit_pack(pool, config.audit_export_limit).await?;
+    if rendered_exports > 0 {
+        tracing::info!(
+            worker_id = %config.worker_id,
+            rendered_exports,
+            "processed queued audit exports"
+        );
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StaleReviewAlert {

@@ -61,6 +61,48 @@ function runSql(sql: string): void {
   );
 }
 
+type ApiRequest = {
+  get: (
+    url: string,
+    options?: unknown,
+  ) => Promise<{ status: () => number; json: () => Promise<Record<string, unknown>> }>;
+};
+
+async function expectClassifiedRun(
+  request: ApiRequest,
+  runId: string,
+  headers: Record<string, string>,
+): Promise<Record<string, unknown>> {
+  let lastDetail: Record<string, unknown> | undefined;
+
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const response = await request.get(`/api/classifications/${runId}`, { headers });
+    expect(response.status()).toBe(200);
+    const detail = await response.json();
+    lastDetail = detail;
+
+    if (["classified", "needs_review"].includes(String(detail.status))) {
+      expect(detail.selected_code).toBe("6205.20");
+      expect(detail.risk_band).toBe("low");
+      expect(String(detail.confidence)).toContain("0.91");
+      expect(detail.input_snapshot).toMatchObject({
+        description: "woven cotton shirt",
+      });
+      expect(detail.candidates).toMatchObject({
+        matched_rules: [expect.objectContaining({ code: "6205.20", confidence: 0.91 })],
+      });
+      expect(detail.explanation).toMatchObject({ runtime: "deterministic_wasm_stub" });
+      return detail;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+
+  throw new Error(
+    `classification ${runId} did not complete before audit export: ${JSON.stringify(lastDetail)}`,
+  );
+}
+
 function goldenRuleSource(code: string): string {
   return JSON.stringify({
     rules: [
@@ -307,6 +349,7 @@ test("import classify override export flow and denied role actions are covered",
   const run = await request.post("/api/classifications/run", { headers, data: { product_ids: [productId] } });
   expect(run.status()).toBe(201);
   const runId = (await run.json()).runs[0].id;
+  await expectClassifiedRun(request, runId, headers);
 
   const override = await request.post(`/api/classifications/${runId}/override`, {
     headers,

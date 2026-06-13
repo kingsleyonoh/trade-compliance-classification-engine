@@ -2,13 +2,16 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use serde_json::{json, Value};
 use sqlx::{Executor, PgPool};
-use std::sync::OnceLock;
+use std::{sync::OnceLock, time::Duration};
 use tokio::sync::{Mutex, MutexGuard};
 use tower::ServiceExt;
 use trade_compliance_classification_engine::app::{app, AppState};
 use trade_compliance_classification_engine::auth::hash_api_key;
 use trade_compliance_classification_engine::classification::service::classify_queued_products;
 use trade_compliance_classification_engine::jobs::lease::lease_classification_jobs;
+use trade_compliance_classification_engine::jobs::workers::{
+    spawn_classification_worker_loop, ClassificationWorkerConfig,
+};
 use trade_compliance_classification_engine::outputs::registry;
 use trade_compliance_classification_engine::outputs::{
     export_audit_pack_from_snapshot, ExportFormat,
@@ -384,6 +387,140 @@ async fn reviewer_override_api_is_append_only_and_denies_auditors() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
     assert_eq!(denied["error"]["code"], "insufficient_scope");
+}
+
+#[tokio::test]
+async fn audit_export_create_rejects_still_queued_classification_run() {
+    let (pool, _guard) = test_pool().await;
+    let app = app(test_state(pool.clone()));
+    let api_key = register_tenant(
+        app.clone(),
+        "Queued Export Tenant",
+        "queued-export@example.test",
+    )
+    .await;
+    activate_rule_pack(app.clone(), &api_key).await;
+    import_ready_product(app.clone(), &api_key, "P2-QUEUED").await;
+    let product_id: uuid::Uuid = sqlx::query_scalar(
+        "SELECT p.id FROM products p JOIN api_keys k ON k.tenant_id=p.tenant_id WHERE k.key_hash=$1 AND p.sku='P2-QUEUED'",
+    )
+    .bind(hash_api_key(&api_key, "test-pepper"))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let (status, body) = request_json(
+        app.clone(),
+        post_json(
+            "/api/classifications/run",
+            &api_key,
+            json!({"product_ids":[product_id]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let run_id = uuid::Uuid::parse_str(body["runs"][0]["id"].as_str().unwrap()).unwrap();
+    assert_eq!(body["runs"][0]["status"], "queued");
+
+    let (status, error) = request_json(
+        app,
+        post_json(
+            "/api/audit-exports",
+            &api_key,
+            json!({"classification_run_id": run_id, "format":"json"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{error}");
+    assert_eq!(error["error"]["code"], "classification_not_complete");
+    let export_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM audit_exports WHERE classification_run_id=$1")
+            .bind(run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        export_count, 0,
+        "queued classifications must not produce audit packs"
+    );
+}
+
+#[tokio::test]
+async fn spawned_worker_loop_processes_queued_classification_without_test_helper() {
+    let (pool, _guard) = test_pool().await;
+    let app = app(test_state(pool.clone()));
+    let api_key = register_tenant(
+        app.clone(),
+        "Worker Loop Tenant",
+        "worker-loop@example.test",
+    )
+    .await;
+    activate_rule_pack(app.clone(), &api_key).await;
+    import_ready_product(app.clone(), &api_key, "P2-WORKER").await;
+    let product_id: uuid::Uuid = sqlx::query_scalar(
+        "SELECT p.id FROM products p JOIN api_keys k ON k.tenant_id=p.tenant_id WHERE k.key_hash=$1 AND p.sku='P2-WORKER'",
+    )
+    .bind(hash_api_key(&api_key, "test-pepper"))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let (status, body) = request_json(
+        app,
+        post_json(
+            "/api/classifications/run",
+            &api_key,
+            json!({"product_ids":[product_id]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let run_id = uuid::Uuid::parse_str(body["runs"][0]["id"].as_str().unwrap()).unwrap();
+
+    let worker = spawn_classification_worker_loop(
+        pool.clone(),
+        ClassificationWorkerConfig {
+            worker_id: "actual-use-test-worker".to_owned(),
+            batch_limit: 5,
+            lease_for: Duration::from_secs(5),
+            interval: Duration::from_millis(100),
+            audit_export_limit: 5,
+        },
+    );
+
+    let mut status = String::from("queued");
+    for _ in 0..30 {
+        status = sqlx::query_scalar("SELECT status FROM classification_runs WHERE id=$1")
+            .bind(run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        if status == "classified" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    worker.abort();
+    assert_eq!(
+        status, "classified",
+        "background worker loop should lease and classify queued runs without tests calling lease_classification_jobs"
+    );
+}
+
+#[test]
+fn main_server_wires_bounded_background_classification_worker_loop() {
+    let main_source = include_str!("../src/main.rs");
+    assert!(
+        main_source.contains("spawn_classification_worker_loop"),
+        "normal cargo run must spawn the classification worker loop from main before serving HTTP"
+    );
+    assert!(
+        main_source.contains("ClassificationWorkerConfig"),
+        "main should configure bounded lease limits and interval for the background worker"
+    );
+    let workers_source = include_str!("../src/jobs/workers.rs");
+    assert!(
+        workers_source.contains("tokio::spawn"),
+        "worker loop must run in the Tokio runtime alongside axum::serve"
+    );
 }
 
 #[tokio::test]

@@ -25,7 +25,7 @@ pub fn optional_health(adapter: &'static str, config: &OptionalIntegrationConfig
         .unwrap_or("")
         .trim()
         .starts_with("http")
-        && config.api_key.as_deref().unwrap_or("").trim().is_empty() == false;
+        && !config.api_key.as_deref().unwrap_or("").trim().is_empty();
     AdapterHealth {
         adapter,
         enabled: true,
@@ -55,14 +55,13 @@ pub fn workflow_health(config: &WorkflowEngineConfig) -> AdapterHealth {
         .unwrap_or("")
         .trim()
         .starts_with("http")
-        && config.api_key.as_deref().unwrap_or("").trim().is_empty() == false
-        && config
+        && !config.api_key.as_deref().unwrap_or("").trim().is_empty()
+        && !config
             .high_risk_review_id
             .as_deref()
             .unwrap_or("")
             .trim()
-            .is_empty()
-            == false;
+            .is_empty();
     AdapterHealth {
         adapter: "workflow_engine",
         enabled: true,
